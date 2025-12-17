@@ -30,6 +30,8 @@ class Config:
     lora_rank: int = 32
     save_every: int = 20  # 0 = disabled
     max_tokens: int = 256
+    wandb_project: str | None = None
+    wandb_name: str | None = None
 
 
 def get_reward(response: str, answer: str) -> float:
@@ -45,8 +47,8 @@ def main(config: Config):
     # Setup logging
     ml_logger = ml_log.setup_logging(
         log_dir=config.log_path,
-        wandb_project=None,
-        wandb_name=None,
+        wandb_project=config.wandb_project,
+        wandb_name=config.wandb_name,
         config=config,
         do_configure_logging_module=True,
     )

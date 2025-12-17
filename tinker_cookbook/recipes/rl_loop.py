@@ -133,7 +133,7 @@ def main(config: Config):
         batch_end = min((batch_idx + 1) * config.batch_size, len(train_dataset))
         batch_rows = train_dataset.select(range(batch_start, batch_end))
 
-        sampling_path = training_client.save_weights_for_sampler(name=f"{step:06d}").result().path
+        sampling_path = training_client.save_weights_for_sampler(name="sampler").result().path
         sampling_client = service_client.create_sampling_client(model_path=sampling_path)
         # Set up sampling parameters
 

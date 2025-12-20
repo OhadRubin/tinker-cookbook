@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
 { name = "Tinker authors", email = "tinker@thinkingmachines.ai" },
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "chz",
     "cloudpickle",
@@ -27,6 +27,9 @@ dependencies = [
     "textarena>=0.7.4",
     "math-verify",
     "scipy",
+    "wandb",
+    "verifiers>=0.1.8.post0",
+    "openai",
 ]
 
 [project.urls]

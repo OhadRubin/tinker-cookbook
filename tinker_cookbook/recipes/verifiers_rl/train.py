@@ -29,6 +29,7 @@ class CLIConfig:
     # model configuration
     model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     lora_rank: int = 32
+    base_url: str | None = None
 
     # environment configuration
     vf_env_id: str = "reverse-text"
@@ -139,6 +140,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         eval_every=cli_config.eval_every,
         save_every=cli_config.save_every,
         stream_minibatch_config=None,
+        base_url=cli_config.base_url,
     )
 
     await train.main(cfg)

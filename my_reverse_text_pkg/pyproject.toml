@@ -1,0 +1,13 @@
+[project]
+name = "my-reverse-text"
+version = "0.1.0"
+description = "Custom reverse text environment for verifiers"
+requires-python = ">=3.10"
+dependencies = [
+    "verifiers",
+    "datasets",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -232,7 +232,7 @@ class WandbLogger(Logger):
     def log_metrics(self, metrics: Dict[str, Any], step: int | None = None) -> None:
         """Log metrics to wandb."""
         if self.run and wandb is not None:
-            wandb.log(metrics, step=step)
+            wandb.log(metrics, step=step, commit=True)
             logger.info("Logging to: %s", self.run.url)
 
     def close(self) -> None:

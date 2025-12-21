@@ -34,6 +34,7 @@ class CLIConfig:
     # environment configuration
     vf_env_id: str = "reverse-text"
     vf_env_args: str | None = None  # JSON string
+    system_prompt_path: str | None = None  # Path to file containing system prompt
     dataset_n: int = -1
     dataset_seed: int | None = None
 
@@ -69,6 +70,9 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)
 
     env_args = json.loads(cli_config.vf_env_args) if cli_config.vf_env_args else {}
+    if cli_config.system_prompt_path:
+        with open(cli_config.system_prompt_path) as f:
+            env_args["system_prompt"] = f.read()
 
     shared_client: TinkerAsyncOpenAIClient | None = None
     shared_renderer: renderers.Renderer | None = None

@@ -1,3 +1,3 @@
 """Re-export for backwards compatibility."""
 
-from tinker_cookbook.renderers import *
+from renderers.qwen3 import *

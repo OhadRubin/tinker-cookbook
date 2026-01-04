@@ -223,13 +223,20 @@ def ensure_text(content: Content) -> str:
     raise ValueError(f"Expected text content, got multimodal content with {len(content)} parts")
 
 
-def _tool_call_payload(tool_call: ToolCall) -> dict[str, object]:
+def _tool_call_payload(tool_call: ToolCall | dict) -> dict[str, object]:
     """Minimal JSON payload for embedding in <tool_call> blocks."""
-    # Convert from nested structure to flat format for compatibility
-    return {
-        "name": tool_call.function.name,
-        "args": json.loads(tool_call.function.arguments),
-    }
+    if isinstance(tool_call, dict):
+        # OpenAI/verifiers format: {"function": {"name": ..., "arguments": ...}, "id": ...}
+        func = tool_call.get("function", {})
+        name = func.get("name", "")
+        args_str = func.get("arguments", "{}")
+        args = json.loads(args_str) if isinstance(args_str, str) else args_str
+    else:
+        # ToolCall object format
+        name = tool_call.function.name
+        args = json.loads(tool_call.function.arguments)
+
+    return {"name": name, "arguments": args}
 
 
 class RenderedMessage(TypedDict):

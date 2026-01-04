@@ -137,14 +137,16 @@ class Qwen3Renderer(Renderer):
                 # Force <think> block for assistant if not present (matching paper)
                 ob_str += "<think>\n"
 
-        # Observation (prompt) part
-        if "tool_calls" in message:
-            tool_calls_str = ""
-            for tool_call in message["tool_calls"]:
-                if tool_calls_str or ac_content:
-                    tool_calls_str += "\n"
-                tool_calls_str += f"<tool_call>\n{json.dumps(_tool_call_payload(tool_call))}\n</tool_call>"
-            ac_content += tool_calls_str
+        # # Render tool_calls from structured field (source of truth)
+        # if "tool_calls" in message:
+        #     # Strip any raw <tool_call> text from content - structured field is authoritative
+        #     ac_content = re.sub(r"\s*<tool_call>.*?</tool_call>\s*", "", ac_content, flags=re.DOTALL)
+        #     tool_calls_str = ""
+        #     for tool_call in message["tool_calls"]:
+        #         if tool_calls_str or ac_content:
+        #             tool_calls_str += "\n"
+        #         tool_calls_str += f"<tool_call>\n{json.dumps(_tool_call_payload(tool_call))}\n</tool_call>"
+        #     ac_content += tool_calls_str
 
         ac_content += "<|im_end|>"
 
@@ -241,7 +243,7 @@ class Qwen3Renderer(Renderer):
         if not isinstance(tool_call, dict):
             return None
         name = tool_call.get("name")
-        args = tool_call.get("args")
+        args = tool_call.get("arguments")
         tool_id = tool_call.get("id")
         if not isinstance(name, str) or not isinstance(args, dict):
             return None

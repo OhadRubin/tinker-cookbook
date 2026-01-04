@@ -62,18 +62,19 @@ class Qwen3VLRenderer(Qwen3Renderer):
             # <think> in the assistant messages, we so don't need to re-add it in those cases.
             ob_str += "<think>\n"
         # Observation (prompt) part
-        if "tool_calls" in message:
-            ac_content_chunks += [
-                TextPart(
-                    type="text",
-                    text="\n".join(
-                        [
-                            f"<tool_call>\n{json.dumps(_tool_call_payload(tool_call))}\n</tool_call>"
-                            for tool_call in message["tool_calls"]
-                        ]
-                    ),
-                )
-            ]
+        # Commented out: content already contains <tool_call> from model output
+        # if "tool_calls" in message:
+        #     ac_content_chunks += [
+        #         TextPart(
+        #             type="text",
+        #             text="\n".join(
+        #                 [
+        #                     f"<tool_call>\n{json.dumps(_tool_call_payload(tool_call))}\n</tool_call>"
+        #                     for tool_call in message["tool_calls"]
+        #                 ]
+        #             ),
+        #         )
+        #     ]
         ac_content_chunks += [TextPart(type="text", text="<|im_end|>")]
         # Action part
 

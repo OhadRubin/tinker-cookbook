@@ -76,9 +76,10 @@ class Qwen3CoderRenderer(Renderer):
         ac_content = message["content"]
 
         # Handle tool calls - render them in XML format
-        if "tool_calls" in message:
-            for tool_call in message["tool_calls"]:
-                ac_content += self._render_tool_call(tool_call)
+        # Commented out: content already contains <tool_call> from model output
+        # if "tool_calls" in message:
+        #     for tool_call in message["tool_calls"]:
+        #         ac_content += self._render_tool_call(tool_call)
 
         ac_content += "<|im_end|>"
 

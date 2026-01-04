@@ -64,13 +64,14 @@ class Qwen3InstructRenderer(Qwen3Renderer):
         ac_content = message["content"]
 
         # Handle tool_calls (same as base class but without thinking logic)
-        if "tool_calls" in message:
-            tool_calls_str = ""
-            for tool_call in message["tool_calls"]:
-                if tool_calls_str or ac_content:
-                    tool_calls_str += "\n"
-                tool_calls_str += f"<tool_call>\n{json.dumps(_tool_call_payload(tool_call))}\n</tool_call>"
-            ac_content += tool_calls_str
+        # Commented out: content already contains <tool_call> from model output
+        # if "tool_calls" in message:
+        #     tool_calls_str = ""
+        #     for tool_call in message["tool_calls"]:
+        #         if tool_calls_str or ac_content:
+        #             tool_calls_str += "\n"
+        #         tool_calls_str += f"<tool_call>\n{json.dumps(_tool_call_payload(tool_call))}\n</tool_call>"
+        #     ac_content += tool_calls_str
 
         ac_content += "<|im_end|>"
 

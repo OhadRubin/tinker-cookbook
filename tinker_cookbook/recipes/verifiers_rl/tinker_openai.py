@@ -74,8 +74,7 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
     async def create(self, *args: Any, **kwargs: Any) -> ChatCompletion | AsyncStream[Any]:
         model = kwargs.get("model", "tinker")
         messages = kwargs.get("messages", [])
-        if kwargs.get("tools"):
-            raise NotImplementedError("Tool calling is not yet supported by this model's renderer.")
+        tools = kwargs.get("tools")
         if kwargs.get("stream", False):
             raise ValueError("stream=True not supported by TinkerAsyncOpenAIClient")
         sampling_args = {k: v for k, v in kwargs.items() if k not in ("model", "messages", "tools")}
@@ -83,58 +82,92 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
         stop = sampling_args.get("stop", self._parent.renderer.get_stop_sequences())
         max_tokens = sampling_args.get("max_tokens") or sampling_args.get("max_completion_tokens")
 
-        model_input = self._parent.renderer.build_generation_prompt(messages)
-        prompt_token_ids: List[int] = model_input.to_ints()
+        # Handle tools by temporarily setting them on the renderer
+        renderer = self._parent.renderer
+        original_tools = getattr(renderer, "tools", None)
+        if tools:
+            if not hasattr(renderer, "tools"):
+                raise NotImplementedError(
+                    f"Tool calling is not supported by renderer {type(renderer).__name__}. "
+                    "Use a Qwen3Renderer or similar renderer that supports tools."
+                )
+            renderer.tools = tools
 
-        sample = await self._parent.sampling_client.sample_async(
-            prompt=model_input,
-            num_samples=1,
-            sampling_params=tinker.SamplingParams(
-                temperature=float(sampling_args.get("temperature", 1.0)),
-                max_tokens=int(max_tokens or 128),
-                top_p=float(sampling_args.get("top_p", 1.0)),
-                top_k=int(sampling_args.get("top_k", -1)),
-                stop=stop,
-            ),
-        )
-        seq = sample.sequences[0]
-        completion_token_ids: List[int] = seq.tokens
-        logprobs: List[float] = seq.logprobs or [0.0] * len(completion_token_ids)
+        try:
+            model_input = renderer.build_generation_prompt(messages)
+            prompt_token_ids: List[int] = model_input.to_ints()
 
-        assistant_message, parse_success = self._parent.renderer.parse_response(
-            completion_token_ids
-        )
-        finish_reason = "stop" if parse_success else "length"
-        response_dict: Dict[str, Any] = {
-            "id": "tinker-chatcmpl",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": assistant_message,
-                    "finish_reason": finish_reason,
-                    "logprobs": {
-                        "content": [
-                            {"token": f"token_id:{tid}", "logprob": lp, "top_logprobs": []}
-                            for tid, lp in zip(completion_token_ids, logprobs)
-                        ]
-                    },
-                }
-            ],
-            "usage": {
-                "prompt_tokens": len(prompt_token_ids),
-                "completion_tokens": len(completion_token_ids),
-                "total_tokens": len(prompt_token_ids) + len(completion_token_ids),
-            },
-        }
-        response = ChatCompletion.model_validate(response_dict)
+            sample = await self._parent.sampling_client.sample_async(
+                prompt=model_input,
+                num_samples=1,
+                sampling_params=tinker.SamplingParams(
+                    temperature=float(sampling_args.get("temperature", 1.0)),
+                    max_tokens=int(max_tokens or 128),
+                    top_p=float(sampling_args.get("top_p", 1.0)),
+                    top_k=int(sampling_args.get("top_k", -1)),
+                    stop=stop,
+                ),
+            )
+            seq = sample.sequences[0]
+            completion_token_ids: List[int] = seq.tokens
+            logprobs: List[float] = seq.logprobs or [0.0] * len(completion_token_ids)
 
-        setattr(response, "prompt_token_ids", prompt_token_ids)
-        setattr(response.choices[0], "token_ids", completion_token_ids)
+            assistant_message, parse_success = renderer.parse_response(
+                completion_token_ids
+            )
 
-        return response
+            # Handle tool_calls in OpenAI format if present
+            if "tool_calls" in assistant_message and assistant_message["tool_calls"]:
+                # Convert internal ToolCall format to OpenAI format
+                openai_tool_calls = []
+                for i, tc in enumerate(assistant_message["tool_calls"]):
+                    openai_tool_calls.append({
+                        "id": tc.id or f"call_{i}",
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                    })
+                assistant_message["tool_calls"] = openai_tool_calls
+                finish_reason = "tool_calls"
+            else:
+                finish_reason = "stop" if parse_success else "length"
+
+            response_dict: Dict[str, Any] = {
+                "id": "tinker-chatcmpl",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": assistant_message,
+                        "finish_reason": finish_reason,
+                        "logprobs": {
+                            "content": [
+                                {"token": f"token_id:{tid}", "logprob": lp, "top_logprobs": []}
+                                for tid, lp in zip(completion_token_ids, logprobs)
+                            ]
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": len(prompt_token_ids),
+                    "completion_tokens": len(completion_token_ids),
+                    "total_tokens": len(prompt_token_ids) + len(completion_token_ids),
+                },
+            }
+            response = ChatCompletion.model_validate(response_dict)
+
+            setattr(response, "prompt_token_ids", prompt_token_ids)
+            setattr(response.choices[0], "token_ids", completion_token_ids)
+
+            return response
+        finally:
+            # Restore original tools setting
+            if tools:
+                renderer.tools = original_tools
 
 
 class TinkerCompletions(OpenAIAsyncCompletions):

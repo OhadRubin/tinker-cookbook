@@ -40,6 +40,7 @@ class TrajectoryState:
     start_time: float | None = None
     end_time: float | None = None
     num_llm_calls: int = 0
+    training_status: str = "pending"  # "pending" | "enqueued" | "done"
 
     def to_dict(self) -> dict:
         return {
@@ -52,6 +53,7 @@ class TrajectoryState:
             "start_time": self.start_time,
             "end_time": self.end_time,
             "num_llm_calls": self.num_llm_calls,
+            "training_status": self.training_status,
         }
 
 
@@ -214,6 +216,20 @@ class TrajectoryProgressTracker:
 
         self._write_state()
 
+    def mark_trajectory_training_enqueued(self, group_id: int, trajectory_id: int) -> None:
+        """Called when forward_backward_async is invoked for a trajectory."""
+        with self._update_lock:
+            if group_id in self._groups and trajectory_id in self._groups[group_id].trajectories:
+                self._groups[group_id].trajectories[trajectory_id].training_status = "enqueued"
+        self._write_state()
+
+    def mark_trajectory_training_done(self, group_id: int, trajectory_id: int) -> None:
+        """Called when forward_backward result is consumed for a trajectory."""
+        with self._update_lock:
+            if group_id in self._groups and trajectory_id in self._groups[group_id].trajectories:
+                self._groups[group_id].trajectories[trajectory_id].training_status = "done"
+        self._write_state()
+
 
 def set_trajectory_context(group_id: int, traj_id: int) -> None:
     trajectory_group_id.set(group_id)
@@ -263,19 +279,24 @@ def watch():
                 status = traj.get("status", "pending")
                 tokens = traj.get("tokens_generated", 0)
                 reward = traj.get("reward")
+                training_status = traj.get("training_status", "pending")
 
+                k = tokens // 1000
                 if status == "completed":
                     completed += 1
                     if reward is not None:
-                        r = f"{reward:+.2f}" if reward != 0 else "0.00"
+                        r = f"{reward:+.1f}" if reward != 0 else "0.0"
                     else:
-                        r = "done"
-                    text.append(f"[{r}]", style="green bold")
+                        r = "?"
+                    text.append(f"[{k:2d}k {r:>4}]", style="green bold")
+                    if training_status == "done":
+                        text.append("T", style="cyan bold")
+                    elif training_status == "enqueued":
+                        text.append("F", style="red bold")
                 elif status == "in_progress":
-                    k = tokens // 1000
-                    text.append(f"[{k:3d}k]", style="blue")
+                    text.append(f"[{k:2d}k    ?]", style="blue")
                 else:
-                    text.append("[  · ]", style="dim")
+                    text.append("[  ·    ·]", style="dim")
                 text.append(" ")
 
             total = len(trajectories)

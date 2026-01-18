@@ -821,6 +821,7 @@ async def do_train_step_streaming_and_get_sampling_client(
     update_scope_context({"step": i_batch})
 
     metrics = {}
+    tracker = TrajectoryProgressTracker.get_instance()
 
     # Run multiple optimizer substeps per training iteration
     all_data_D = []
@@ -831,6 +832,8 @@ async def do_train_step_streaming_and_get_sampling_client(
         # Once we have enough trajectories for a minibatch, train on them
         wrapped_trajectory_groups = []
         forward_backward_futures: list[tinker.APIFuture[tinker.ForwardBackwardOutput]] = []
+        minibatch_trajectories: list[list[tuple[int, int]]] = []  # [(group_id, traj_id), ...]
+        consumed_count = 0  # Track how many futures we've already consumed
         i_minibatch = 0
         while i_minibatch < cfg.stream_minibatch_config.num_minibatches:
             wrapped_trajectory_group = await trajectory_groups_queue.get()
@@ -863,13 +866,36 @@ async def do_train_step_streaming_and_get_sampling_client(
             )
             metrics.update(prepare_minibatch_metrics)
 
+            # Track (group_id, trajectory_id) pairs in this minibatch
+            trajectories_in_minibatch: list[tuple[int, int]] = []
+            for wg in wrapped_trajectory_groups:
+                if hasattr(wg.env_group_builder, "_progress_group_id"):
+                    gid = wg.env_group_builder._progress_group_id
+                    for tid in range(len(wg.trajectory_group.trajectories_G)):
+                        trajectories_in_minibatch.append((gid, tid))
+            minibatch_trajectories.append(trajectories_in_minibatch)
+
             # Enqueue forward-backward (we'll await results after all minibatches are enqueued)
             with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_enqueue", metrics):
+                for gid, tid in trajectories_in_minibatch:
+                    tracker.mark_trajectory_training_enqueued(gid, tid)
                 forward_backward_futures.append(
                     await training_client.forward_backward_async(
                         [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
                     )
                 )
+
+            # Consume any ready results immediately (interleaved with enqueuing)
+            while consumed_count < len(forward_backward_futures):
+                if not forward_backward_futures[consumed_count].future().done():
+                    break
+                with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{consumed_count}_consume", metrics):
+                    fwd_bwd_result = await forward_backward_futures[consumed_count].result_async()
+                    all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
+                for gid, tid in minibatch_trajectories[consumed_count]:
+                    tracker.mark_trajectory_training_done(gid, tid)
+                consumed_count += 1
+
             all_data_D.extend(data_D)
             all_wrapped_trajectory_groups.extend(wrapped_trajectory_groups)
             i_minibatch += 1
@@ -882,18 +908,13 @@ async def do_train_step_streaming_and_get_sampling_client(
         with timed(f"train/optim_substep_{i_substep}_enqueue", metrics):
             optim_future = await training_client.optim_step_async(adam_params)
 
-        # Now consume all forward-backward results
-        # TODO: Add visualization mechanism to show which trajectories have completed fwd_bwd.
-        #       Currently trajectory_progress.py only tracks sampling status (PENDING -> IN_PROGRESS -> COMPLETED).
-        #       We want to add a new state or indicator showing which groups have been sent through
-        #       forward_backward_async and which have had their results consumed. This would let the
-        #       watcher UI (uv run python -m tinker_cookbook.utils.trajectory_progress) display
-        #       training progress alongside sampling progress - e.g., "[+0.5] -> [trained]" or a separate column.
-        #       See: tinker_cookbook/utils/trajectory_progress.py (TrajectoryProgressTracker, GroupState, watch())
-        for i_mb, fwd_bwd_future in enumerate(forward_backward_futures):
+        # Consume remaining forward-backward results (those not yet consumed during enqueuing)
+        for i_mb in range(consumed_count, len(forward_backward_futures)):
             with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume", metrics):
-                fwd_bwd_result = await fwd_bwd_future.result_async()
+                fwd_bwd_result = await forward_backward_futures[i_mb].result_async()
                 all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
+            for gid, tid in minibatch_trajectories[i_mb]:
+                tracker.mark_trajectory_training_done(gid, tid)
 
         with timed(f"train/optim_substep_{i_substep}_consume", metrics):
             await optim_future.result_async()

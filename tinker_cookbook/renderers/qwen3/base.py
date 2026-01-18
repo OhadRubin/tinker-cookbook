@@ -224,6 +224,24 @@ class Qwen3Renderer(Renderer):
                 i += 1
 
         return grouped
+    # TODO: verify if this shit is legal from a "TrainOnWhat" perspective
+    def _render_message_tokens(
+        self,
+        idx: int,
+        message: Message,
+        is_last: bool = False,
+        last_query_index: int | None = None,
+    ) -> list[int]:
+        """Render a message and return flattened token list (prefix + content)."""
+        rendered = self.render_message(idx, message, is_last=is_last, last_query_index=last_query_index)
+        tokens: list[int] = []
+        prefix = rendered.get("prefix")
+        if prefix:
+            tokens.extend(prefix.tokens)
+        for chunk in rendered["content"]:
+            if chunk:
+                tokens.extend(chunk.tokens)
+        return tokens
 
     @property
     def _end_message_token(self) -> int:
@@ -274,6 +292,9 @@ class Qwen3Renderer(Renderer):
             enable_thinking: if False, immediately outputs empty <think></think> block.
                 This is useful when you want to skip the thinking phase.
         """
+        # TODO: verify if this shit is legal from a "TrainOnWhat" perspective
+        # NOTE: usually ModelInputChunk is used for seperating out what get's trained on (the weights) and what doesn't, here we use it to group stuff 
+        # to reduce cache misses.
         # Group tool messages
         messages = self._group_tool_messages(messages)
 
@@ -288,42 +309,58 @@ class Qwen3Renderer(Renderer):
             system_content = ensure_text(messages[0]["content"])
             messages[0] = Message(role="system", content=self._build_tools_system_message(system_content))
 
-        chunks: list[tinker.types.ModelInputChunk] = []
-        if self._bos_tokens:
-            chunks.append(tinker.types.EncodedTextChunk(tokens=self._bos_tokens))
-
         # Find last query index for multi-step tool handling
         last_query_index = self._find_last_query_index(messages)
+        # TODO: verify if this shit is legal from a "TrainOnWhat" perspective
+        # Build chunks with turn-based structure for KV cache affinity routing.
+        # Structure: [system_chunk, turn1_chunk, turn2_chunk, ..., current_partial_chunk]
+        # This reduces chunk count from 2*N to ~N/2, enabling effective hierarchical prefix matching.
+        chunks: list[tinker.types.ModelInputChunk] = []
 
-        for idx, message in enumerate(messages):
-            rendered_message = self.render_message(idx, message, last_query_index=last_query_index)
-            ob_chunk = rendered_message.get("prefix")
-            action_chunks = rendered_message["content"]
-            if ob_chunk:
-                chunks.append(ob_chunk)
-            chunks.extend([x for x in action_chunks if x])
+        # Chunk 0: BOS + system message (if present)
+        system_tokens: list[int] = list(self._bos_tokens) if self._bos_tokens else []
+        msg_start_idx = 0
+        if messages and messages[0]["role"] == "system":
+            system_tokens.extend(self._render_message_tokens(0, messages[0], last_query_index=last_query_index))
+            msg_start_idx = 1
+        chunks.append(tinker.types.EncodedTextChunk(tokens=system_tokens))
 
+        # Chunks 1..N-1: Complete turns (user + assistant pairs)
+        # A turn ends after an assistant message, unless it's the final message (incomplete turn)
+        remaining_messages = messages[msg_start_idx:]
+        turn_tokens: list[int] = []
+
+        for idx, message in enumerate(remaining_messages):
+            original_idx = idx + msg_start_idx  # Index in original messages list
+            turn_tokens.extend(self._render_message_tokens(
+                original_idx, message, last_query_index=last_query_index
+            ))
+
+            is_assistant = message["role"] == "assistant"
+            is_last = idx == len(remaining_messages) - 1
+
+            # End turn after assistant message, but not if it's the last message (incomplete turn)
+            if is_assistant and not is_last:
+                chunks.append(tinker.types.EncodedTextChunk(tokens=turn_tokens))
+                turn_tokens = []
+
+        # Chunk N: Current incomplete turn (remaining tokens + new assistant prefix + prefill)
         new_partial_message = Message(role=role, content="")
-        rendered_message = self.render_message(len(messages), new_partial_message)
-        ob_chunk = rendered_message.get("prefix")
-        if ob_chunk:
-            chunks.append(ob_chunk)
+        rendered_partial = self.render_message(len(messages), new_partial_message)
+        partial_prefix = rendered_partial.get("prefix")
+        if partial_prefix:
+            turn_tokens.extend(partial_prefix.tokens)
 
         # Handle enable_thinking option
         if not enable_thinking:
             empty_think = "<think>\n\n</think>\n\n"
-            chunks.append(
-                tinker.types.EncodedTextChunk(
-                    tokens=self.tokenizer.encode(empty_think, add_special_tokens=False)
-                )
-            )
+            turn_tokens.extend(self.tokenizer.encode(empty_think, add_special_tokens=False))
 
         if prefill:
-            chunks.append(
-                tinker.types.EncodedTextChunk(
-                    tokens=self.tokenizer.encode(prefill, add_special_tokens=False)
-                )
-            )
+            turn_tokens.extend(self.tokenizer.encode(prefill, add_special_tokens=False))
+
+        chunks.append(tinker.types.EncodedTextChunk(tokens=turn_tokens))
+
         return tinker.ModelInput(chunks=chunks)
 
     def build_supervised_example(

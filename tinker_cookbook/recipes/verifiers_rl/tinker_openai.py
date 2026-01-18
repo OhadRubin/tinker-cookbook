@@ -121,8 +121,8 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             if group_id is not None:
                 assert traj_idx is not None
                 tracker = TrajectoryProgressTracker.get_instance()
-                total_tokens = len(prompt_token_ids) + len(completion_token_ids)
-                tracker.track_llm_call(group_id, total_tokens, traj_idx)
+                context_length = len(prompt_token_ids)
+                tracker.track_llm_call(group_id, context_length, traj_idx)
 
             assistant_message, parse_success = renderer.parse_response(
                 completion_token_ids

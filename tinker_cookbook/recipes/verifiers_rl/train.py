@@ -147,16 +147,20 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
 
         if group_id is not None:
             rewards = [state.get("reward") or 0.0 for state in states]
-            token_counts = []
+            context_lengths = []
             for state in states:
-                total_tokens = 0
-                for step in state.get("trajectory", []):
-                    tokens_data = step.get("tokens")
+                trajectory = state.get("trajectory", [])
+                if trajectory:
+                    last_step = trajectory[-1]
+                    tokens_data = last_step.get("tokens")
                     if tokens_data:
-                        total_tokens += len(tokens_data.get("prompt_ids", []))
-                        total_tokens += len(tokens_data.get("completion_ids", []))
-                token_counts.append(total_tokens)
-            tracker.complete_group(group_id, rewards, token_counts)
+                        # TODO: add completion tokens too
+                        context_lengths.append(len(tokens_data.get("prompt_ids", [])))
+                    else:
+                        context_lengths.append(0)
+                else:
+                    context_lengths.append(0)
+            tracker.complete_group(group_id, rewards, context_lengths)
 
         return convert_states_to_trajectory_group(states)
 

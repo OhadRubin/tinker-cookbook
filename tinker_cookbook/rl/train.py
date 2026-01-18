@@ -15,6 +15,7 @@ import numpy as np
 import tinker
 import torch
 from tinker.types import LossFnType
+from tinker_cookbook.utils.trajectory_progress import TrajectoryProgressTracker
 from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.completers import TinkerTokenCompleter
 from tinker_cookbook.display import colorize_example
@@ -993,6 +994,12 @@ async def do_sync_training(
         # Get batch and sample trajectories
         env_group_builders_P = dataset.get_batch(i_batch)
 
+        # Tag each builder with its group_id for progress tracking
+        for i, builder in enumerate(env_group_builders_P):
+            builder._progress_group_id = i
+
+        tracker = TrajectoryProgressTracker.get_instance()
+
         # Initialize logtree trace for this iteration if logging is enabled
         with _get_logtree_scope(
             log_path=cfg.log_path,
@@ -1002,9 +1009,9 @@ async def do_sync_training(
         ):
             # Note: do_remove_constant_reward_groups=False here because we remove
             # constant reward groups after all rollouts are collected (below)
-            trajectory_groups_P = await asyncio.gather(
-                *[
-                    asyncio.create_task(
+            with tracker.track_batch(len(env_group_builders_P)):
+                trajectory_groups_P = await asyncio.gather(
+                    *[
                         do_group_rollout_and_filter_constant_reward(
                             sampling_client,
                             builder,
@@ -1012,12 +1019,15 @@ async def do_sync_training(
                             temperature=cfg.temperature,
                             do_remove_constant_reward_groups=False,
                             enable_logging=i < cfg.num_groups_to_log,
-                        ),
-                        name=f"sample_task_{i}",
-                    )
-                    for i, builder in enumerate(env_group_builders_P)
-                ],
-            )
+                        )
+                        for i, builder in enumerate(env_group_builders_P)
+                    ],
+                )
+
+        # Clean up temporary attributes
+        for builder in env_group_builders_P:
+            if hasattr(builder, "_progress_group_id"):
+                delattr(builder, "_progress_group_id")
 
         if cfg.remove_constant_reward_groups:
             trajectory_groups_P = remove_constant_reward_groups(trajectory_groups_P)

@@ -30,6 +30,7 @@ dependencies = [
     "wandb",
     "verifiers>=0.1.8.post0",
     "openai",
+    "tqdm>=4.67.1",
 ]
 
 [project.urls]

@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Literal, overload
 
 import tinker
 from openai import AsyncOpenAI
+
+from tinker_cookbook.utils.trajectory_progress import (
+    TrajectoryProgressTracker,
+    get_trajectory_context,
+)
 from openai._streaming import AsyncStream
 from openai.resources.chat import AsyncChat as OpenAIAsyncChat
 from openai.resources.chat.completions import AsyncCompletions as OpenAIAsyncChatCompletions
@@ -111,6 +116,12 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             seq = sample.sequences[0]
             completion_token_ids: List[int] = seq.tokens
             logprobs: List[float] = seq.logprobs or [0.0] * len(completion_token_ids)
+
+            group_id, _ = get_trajectory_context()
+            if group_id is not None:
+                tracker = TrajectoryProgressTracker.get_instance()
+                total_tokens = len(prompt_token_ids) + len(completion_token_ids)
+                tracker.track_llm_call(group_id, total_tokens)
 
             assistant_message, parse_success = renderer.parse_response(
                 completion_token_ids

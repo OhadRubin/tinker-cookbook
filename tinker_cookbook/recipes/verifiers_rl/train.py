@@ -20,6 +20,11 @@ from tinker_cookbook.recipes.verifiers_rl.verifiers_env import (
 from tinker_cookbook.rl import train
 from tinker_cookbook.rl.types import EnvGroupBuilder, TrajectoryGroup
 from tinker_cookbook.tokenizer_utils import Tokenizer, get_tokenizer
+from tinker_cookbook.utils.trajectory_progress import (
+    TrajectoryProgressTracker,
+    set_trajectory_context,
+    clear_trajectory_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,17 +116,41 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         gen_sem = shared_gen_sem
         score_sem = shared_score_sem
 
-        states = await vf_builder.vf_env.run_group(
-            group_inputs=rollout_inputs,
-            client=shared_client,
-            model="tinker",
-            gen_sampling_args={
-                "max_tokens": cli_config.max_tokens,
-                "temperature": cli_config.temperature,
-            },
-            gen_sem=gen_sem,
-            score_sem=score_sem,
-        )
+        group_id = getattr(builder, "_progress_group_id", None)
+        tracker = TrajectoryProgressTracker.get_instance()
+
+        if group_id is not None:
+            set_trajectory_context(group_id)
+            tracker.start_group(group_id)
+
+        try:
+            states = await vf_builder.vf_env.run_group(
+                group_inputs=rollout_inputs,
+                client=shared_client,
+                model="tinker",
+                gen_sampling_args={
+                    "max_tokens": cli_config.max_tokens,
+                    "temperature": cli_config.temperature,
+                },
+                gen_sem=gen_sem,
+                score_sem=score_sem,
+            )
+        finally:
+            if group_id is not None:
+                clear_trajectory_context()
+
+        if group_id is not None:
+            rewards = [state.get("reward") or 0.0 for state in states]
+            token_counts = []
+            for state in states:
+                total_tokens = 0
+                for step in state.get("trajectory", []):
+                    tokens_data = step.get("tokens")
+                    if tokens_data:
+                        total_tokens += len(tokens_data.get("prompt_ids", []))
+                        total_tokens += len(tokens_data.get("completion_ids", []))
+                token_counts.append(total_tokens)
+            tracker.complete_group(group_id, rewards, token_counts)
 
         return convert_states_to_trajectory_group(states)
 
@@ -134,6 +163,14 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         groups_per_batch=cli_config.groups_per_batch,
         dataset_n=cli_config.dataset_n,
         dataset_seed=cli_config.dataset_seed,
+    )
+
+    tracker = TrajectoryProgressTracker.get_instance()
+    tracker.configure(
+        max_tokens=65536,
+        group_size=cli_config.group_size,
+        enabled=True,
+        refresh_rate=4.0,
     )
 
     cfg = train.Config(

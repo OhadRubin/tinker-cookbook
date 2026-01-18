@@ -438,10 +438,10 @@ def watch():
                         rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style="bright_green")
                     else:
                         rwd_text = Text("   ?", style="bright_green")
-                    ctx_text.stylize("bright_green")
+                    ctx_text.stylize("white")
                 elif status == "in_progress":
                     rwd_text = Text("   ?", style="bright_cyan bold")
-                    ctx_text.stylize("bright_cyan bold")
+                    ctx_text.stylize("white")
                 else:
                     rwd_text = Text("   ·", style="dim")
 

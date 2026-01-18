@@ -403,10 +403,10 @@ def watch():
 
         # Add 4 columns per trajectory: ctx, rwd, age, status
         for tid in range(group_size):
-            table.add_column(f"ctx", width=3, justify="right", style="dim")
-            table.add_column(f"rwd", width=4, justify="right", style="dim")
-            table.add_column(f"age", width=3, justify="right", style="dim")
-            table.add_column(f"st", width=1, justify="center", style="dim")
+            table.add_column(f"ctx", width=3, justify="right")
+            table.add_column(f"rwd", width=4, justify="right")
+            table.add_column(f"age", width=3, justify="right")
+            table.add_column(f"st", width=1, justify="center")
 
         table.add_column("Done", width=5, justify="right")
         table.add_column("Time", width=5, justify="right")
@@ -429,20 +429,20 @@ def watch():
 
                 # Context length in k
                 k = tokens // 1000
-                ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·")
 
-                # Reward
+                # Reward and context styling based on status
                 if status == "completed":
                     completed += 1
+                    ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
                     if reward is not None:
                         rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style="bright_green")
                     else:
                         rwd_text = Text("   ?", style="bright_green")
-                    ctx_text.stylize("white")
                 elif status == "in_progress":
+                    ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
                     rwd_text = Text("   ?", style="bright_cyan bold")
-                    ctx_text.stylize("white")
                 else:
+                    ctx_text = Text("  ·", style="dim")
                     rwd_text = Text("   ·", style="dim")
 
                 # Time since touched (age in seconds)

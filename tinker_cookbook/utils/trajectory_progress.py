@@ -186,8 +186,8 @@ class TrajectoryProgressTracker:
                 traj.tokens_generated = tokens
                 traj.num_llm_calls = 1
             elif in_progress:
-                traj = min(in_progress, key=lambda t: t.tokens_generated)
-                traj.tokens_generated += tokens
+                traj = min(in_progress, key=lambda t: t.num_llm_calls)
+                traj.tokens_generated = tokens  # Latest context size, not cumulative
                 traj.num_llm_calls += 1
 
             self._call_counters[group_id] += 1
@@ -283,10 +283,10 @@ def watch():
                         r = "done"
                     text.append(f"[{r}]", style="green bold")
                 elif status == "in_progress":
-                    pct = min(99, int(100 * tokens / max(1, max_tokens)))
-                    text.append(f"[{pct:2d}%]", style="blue")
+                    k = tokens // 1000
+                    text.append(f"[{k:3d}k]", style="blue")
                 else:
-                    text.append("[  ·]", style="dim")
+                    text.append("[  · ]", style="dim")
                 text.append(" ")
 
             total = len(trajectories)

@@ -251,12 +251,147 @@ def clear_trajectory_context() -> None:
 
 def watch():
     """Watch the progress file and display with rich."""
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
+    from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
 
     console = Console()
+
+    def compute_stats(state: dict) -> dict:
+        """Compute summary statistics from current state."""
+        groups = state.get("groups", {})
+        batch_start = state.get("batch_start_time")
+        now = time.time()
+
+        total_groups = len(groups)
+        total_trajectories = 0
+        completed_trajectories = 0
+        training_enqueued = 0
+        training_done = 0
+        total_tokens = 0
+
+        # Track completion times for rolling average
+        group_completion_times: list[float] = []
+        traj_completion_times: list[float] = []
+
+        for gid, group in groups.items():
+            trajectories = group.get("trajectories", {})
+            total_trajectories += len(trajectories)
+
+            if group.get("end_time"):
+                group_completion_times.append(group["end_time"])
+
+            for tid, traj in trajectories.items():
+                tokens = traj.get("tokens_generated", 0)
+                total_tokens += tokens
+
+                if traj.get("status") == "completed":
+                    completed_trajectories += 1
+                    if traj.get("end_time"):
+                        traj_completion_times.append(traj["end_time"])
+
+                ts = traj.get("training_status", "pending")
+                if ts == "enqueued":
+                    training_enqueued += 1
+                elif ts == "done":
+                    training_done += 1
+
+        completed_groups = len(group_completion_times)
+        pending_groups = total_groups - completed_groups
+        pending_trajectories = total_trajectories - completed_trajectories
+
+        # Calculate elapsed time
+        elapsed = (now - batch_start) if batch_start else 0
+
+        # Overall average rates (since batch start)
+        overall_traj_rate = completed_trajectories / elapsed if elapsed > 0 else 0
+        overall_group_rate = completed_groups / elapsed if elapsed > 0 else 0
+        overall_token_rate = total_tokens / elapsed if elapsed > 0 else 0
+
+        # Rolling average (last 60 seconds)
+        rolling_window = 60.0
+        cutoff = now - rolling_window
+
+        recent_trajs = sum(1 for t in traj_completion_times if t > cutoff)
+        recent_groups = sum(1 for t in group_completion_times if t > cutoff)
+
+        # Calculate actual window duration (min of rolling_window or time since first completion in window)
+        recent_traj_times = [t for t in traj_completion_times if t > cutoff]
+        recent_group_times = [t for t in group_completion_times if t > cutoff]
+
+        rolling_traj_rate = recent_trajs / rolling_window if recent_trajs > 0 else overall_traj_rate
+        rolling_group_rate = recent_groups / rolling_window if recent_groups > 0 else overall_group_rate
+
+        # ETAs
+        # Per-batch ETA: time until all groups finish sampling
+        eta_batch_overall = pending_groups / overall_group_rate if overall_group_rate > 0 else float('inf')
+        eta_batch_rolling = pending_groups / rolling_group_rate if rolling_group_rate > 0 else float('inf')
+
+        # Per-trajectory ETA: time until all trajectories sampled
+        eta_traj_overall = pending_trajectories / overall_traj_rate if overall_traj_rate > 0 else float('inf')
+        eta_traj_rolling = pending_trajectories / rolling_traj_rate if rolling_traj_rate > 0 else float('inf')
+
+        return {
+            "elapsed": elapsed,
+            "total_groups": total_groups,
+            "completed_groups": completed_groups,
+            "total_trajectories": total_trajectories,
+            "completed_trajectories": completed_trajectories,
+            "training_enqueued": training_enqueued,
+            "training_done": training_done,
+            "total_tokens": total_tokens,
+            "overall_traj_rate": overall_traj_rate,
+            "overall_group_rate": overall_group_rate,
+            "overall_token_rate": overall_token_rate,
+            "rolling_traj_rate": rolling_traj_rate,
+            "rolling_group_rate": rolling_group_rate,
+            "eta_batch_overall": eta_batch_overall,
+            "eta_batch_rolling": eta_batch_rolling,
+            "eta_traj_overall": eta_traj_overall,
+            "eta_traj_rolling": eta_traj_rolling,
+        }
+
+    def format_time(seconds: float) -> str:
+        """Format seconds as MM:SS or HH:MM:SS."""
+        if seconds == float('inf') or seconds < 0:
+            return "--:--"
+        if seconds >= 3600:
+            return f"{int(seconds // 3600)}:{int((seconds % 3600) // 60):02d}:{int(seconds % 60):02d}"
+        return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+    def build_dashboard(stats: dict) -> Panel:
+        """Build the summary dashboard panel."""
+        text = Text()
+
+        # Row 1: Progress counts
+        text.append("Progress: ", style="bold")
+        text.append(f"Groups {stats['completed_groups']}/{stats['total_groups']}", style="cyan")
+        text.append(" │ ", style="dim")
+        text.append(f"Sampled {stats['completed_trajectories']}/{stats['total_trajectories']}", style="green")
+        text.append(" │ ", style="dim")
+        text.append(f"Training F:{stats['training_enqueued']} T:{stats['training_done']}", style="yellow")
+        text.append("\n")
+
+        # Row 2: Throughput
+        text.append("Throughput: ", style="bold")
+        text.append(f"{stats['rolling_traj_rate']:.2f} traj/s", style="magenta")
+        text.append(" │ ", style="dim")
+        text.append(f"{stats['rolling_group_rate']:.2f} grp/s", style="magenta")
+        text.append(" │ ", style="dim")
+        text.append(f"{stats['overall_token_rate'] / 1000:.1f}k tok/s", style="magenta")
+        text.append("\n")
+
+        # Row 3: ETAs
+        text.append("ETA (rolling/overall): ", style="bold")
+        text.append(f"Batch {format_time(stats['eta_batch_rolling'])}/{format_time(stats['eta_batch_overall'])}", style="blue")
+        text.append(" │ ", style="dim")
+        text.append(f"Trajs {format_time(stats['eta_traj_rolling'])}/{format_time(stats['eta_traj_overall'])}", style="blue")
+        text.append(" │ ", style="dim")
+        text.append(f"Elapsed {format_time(stats['elapsed'])}", style="dim")
+
+        return Panel(text, title="Dashboard", border_style="bright_black", padding=(0, 1))
 
     def build_table(state: dict) -> Table:
         table = Table(title="Trajectory Collection", expand=False, box=None)
@@ -313,6 +448,13 @@ def watch():
 
         return table
 
+    def build_display(state: dict) -> Group:
+        """Build complete display with dashboard and table."""
+        stats = compute_stats(state)
+        dashboard = build_dashboard(stats)
+        table = build_table(state)
+        return Group(dashboard, table)
+
     console.print("[yellow]Watching /tmp/trajectory_progress.json...[/yellow]")
     console.print("[dim]Start training in another terminal[/dim]\n")
 
@@ -327,7 +469,7 @@ def watch():
                     if mtime != last_mtime:
                         last_mtime = mtime
                         state = json.loads(PROGRESS_FILE.read_text())
-                        live.update(build_table(state))
+                    live.update(build_display(state))
                 time.sleep(0.1)
             except KeyboardInterrupt:
                 break

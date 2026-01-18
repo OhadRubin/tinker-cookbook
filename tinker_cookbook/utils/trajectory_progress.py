@@ -440,8 +440,8 @@ def watch():
                         rwd_text = Text("   ?", style="bright_green")
                     ctx_text.stylize("bright_green")
                 elif status == "in_progress":
-                    rwd_text = Text("   ?", style="cyan bold")
-                    ctx_text.stylize("cyan bold")
+                    rwd_text = Text("   ?", style="bright_cyan bold")
+                    ctx_text.stylize("bright_cyan bold")
                 else:
                     rwd_text = Text("   ·", style="dim")
 
@@ -451,13 +451,13 @@ def watch():
                     age_text = Text(f"{age:3d}" if age < 1000 else "999", style="bright_green")
                 elif start_time:
                     age = int(now - start_time)
-                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="cyan bold")
+                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="bright_cyan bold")
                 else:
                     age_text = Text("  ·", style="dim")
 
                 # Training status
                 if training_status == "done":
-                    st_text = Text("T", style="cyan bold")
+                    st_text = Text("T", style="bright_cyan bold")
                 elif training_status == "enqueued":
                     st_text = Text("F", style="red bold")
                 else:

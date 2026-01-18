@@ -77,11 +77,14 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
     shared_client: TinkerAsyncOpenAIClient | None = None
     shared_renderer: renderers.Renderer | None = None
     local_tokenizer: Tokenizer | None = None
+    shared_gen_sem: asyncio.Semaphore | None = None
+    shared_score_sem: asyncio.Semaphore | None = None
 
     async def custom_do_group_rollout(
         builder: EnvGroupBuilder, policy: TokenCompleter
     ) -> TrajectoryGroup:
         nonlocal shared_client, shared_renderer, local_tokenizer
+        nonlocal shared_gen_sem, shared_score_sem
 
         # initialize tokenizer and renderer lazily
         if local_tokenizer is None:
@@ -101,8 +104,12 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         vf_builder = cast(VerifiersEnvGroupBuilder, builder)
         rollout_inputs = vf_builder.get_rollout_inputs(cli_config.group_size)
 
-        gen_sem = await maybe_semaphore(cli_config.max_concurrent_generation)
-        score_sem = await maybe_semaphore(cli_config.max_concurrent_scoring)
+        if shared_gen_sem is None:
+            shared_gen_sem = await maybe_semaphore(cli_config.max_concurrent_generation)
+        if shared_score_sem is None:
+            shared_score_sem = await maybe_semaphore(cli_config.max_concurrent_scoring)
+        gen_sem = shared_gen_sem
+        score_sem = shared_score_sem
 
         states = await vf_builder.vf_env.run_group(
             group_inputs=rollout_inputs,

@@ -1,3 +1,5 @@
+@frameworks_graph.md
+
 # Tinker Cookbook Agent Guide
 
 Quick reference for agents working on `tinker-cookbook`. Full documentation is in `docs/`.

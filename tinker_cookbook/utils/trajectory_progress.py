@@ -435,23 +435,23 @@ def watch():
                 if status == "completed":
                     completed += 1
                     if reward is not None:
-                        rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style="green")
+                        rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style="bright_green")
                     else:
-                        rwd_text = Text("   ?", style="green")
-                    ctx_text.stylize("green")
+                        rwd_text = Text("   ?", style="bright_green")
+                    ctx_text.stylize("bright_green")
                 elif status == "in_progress":
-                    rwd_text = Text("   ?", style="blue")
-                    ctx_text.stylize("blue")
+                    rwd_text = Text("   ?", style="bright_blue")
+                    ctx_text.stylize("bright_blue")
                 else:
                     rwd_text = Text("   ·", style="dim")
 
                 # Time since touched (age in seconds)
                 if end_time:
                     age = int(now - end_time)
-                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="green")
+                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="bright_green")
                 elif start_time:
                     age = int(now - start_time)
-                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="blue")
+                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="bright_blue")
                 else:
                     age_text = Text("  ·", style="dim")
 

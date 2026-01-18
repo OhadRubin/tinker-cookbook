@@ -401,12 +401,14 @@ def watch():
         table = Table(title="Trajectory Collection", expand=False, box=None)
         table.add_column("Grp", style="cyan", width=3, no_wrap=True)
 
-        # Add 4 columns per trajectory: ctx, rwd, age, status
+        # Add 4 columns per trajectory: ctx, rwd, age, status + delimiter
         for tid in range(group_size):
             table.add_column(f"ctx", width=3, justify="right")
             table.add_column(f"rwd", width=4, justify="right")
             table.add_column(f"age", width=3, justify="right")
             table.add_column(f"st", width=1, justify="center")
+            if tid < group_size - 1:
+                table.add_column("", width=1)  # delimiter column
 
         table.add_column("Done", width=5, justify="right")
         table.add_column("Time", width=5, justify="right")
@@ -464,6 +466,8 @@ def watch():
                     st_text = Text("·", style="dim")
 
                 row.extend([ctx_text, rwd_text, age_text, st_text])
+                if tid < group_size - 1:
+                    row.append(Text("│", style="dim"))
 
             # Global columns
             total = len(trajectories) if trajectories else group_size

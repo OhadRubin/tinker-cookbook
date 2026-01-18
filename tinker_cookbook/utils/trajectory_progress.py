@@ -26,6 +26,7 @@ trajectory_index: ContextVar[int | None] = ContextVar("traj_index", default=None
 class TrajectoryStatus(Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
+    SAMPLED = "sampled"  # done sampling, awaiting scoring
     COMPLETED = "completed"
 
 
@@ -198,6 +199,16 @@ class TrajectoryProgressTracker:
                 traj = self._groups[group_id].trajectories[trajectory_id]
                 traj.status = TrajectoryStatus.COMPLETED
                 traj.reward = reward
+                traj.tokens_generated = total_tokens
+                traj.end_time = time.time()
+        self._write_state()
+
+    def mark_trajectory_sampled(self, group_id: int, trajectory_id: int, total_tokens: int) -> None:
+        """Called when a trajectory finishes sampling but hasn't been scored yet."""
+        with self._update_lock:
+            if group_id in self._groups and trajectory_id in self._groups[group_id].trajectories:
+                traj = self._groups[group_id].trajectories[trajectory_id]
+                traj.status = TrajectoryStatus.SAMPLED
                 traj.tokens_generated = total_tokens
                 traj.end_time = time.time()
         self._write_state()
@@ -493,6 +504,10 @@ def watch():
                         rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style=rwd_style)
                     else:
                         rwd_text = Text("   ?", style="yellow")
+                elif status == "sampled":
+                    completed += 1  # count as completed for Done column
+                    ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
+                    rwd_text = Text("   ?", style="bright_magenta bold")
                 elif status == "in_progress":
                     ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
                     rwd_text = Text("   ?", style="bright_cyan bold")
@@ -517,6 +532,8 @@ def watch():
                     st_text = Text("D", style="bright_cyan bold")
                 elif training_status == "enqueued":
                     st_text = Text("R", style="red bold")
+                elif status == "sampled":
+                    st_text = Text("W", style="bright_magenta bold")
                 else:
                     st_text = Text("·", style="dim")
 

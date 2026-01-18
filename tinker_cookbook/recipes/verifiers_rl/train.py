@@ -120,24 +120,30 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         tracker = TrajectoryProgressTracker.get_instance()
 
         if group_id is not None:
-            set_trajectory_context(group_id)
             tracker.start_group(group_id)
 
-        try:
-            states = await vf_builder.vf_env.run_group(
-                group_inputs=rollout_inputs,
-                client=shared_client,
-                model="tinker",
-                gen_sampling_args={
-                    "max_tokens": cli_config.max_tokens,
-                    "temperature": cli_config.temperature,
-                },
-                gen_sem=gen_sem,
-                score_sem=score_sem,
-            )
-        finally:
+        gen_sampling_args = {
+            "max_tokens": cli_config.max_tokens,
+            "temperature": cli_config.temperature,
+        }
+
+        async def run_rollout_with_context(traj_idx: int, rollout_input):
             if group_id is not None:
-                clear_trajectory_context()
+                set_trajectory_context(group_id, traj_idx)
+            try:
+                return await vf_builder.vf_env.run_rollout(
+                    gen_sem, rollout_input, shared_client, "tinker", gen_sampling_args
+                )
+            finally:
+                if group_id is not None:
+                    clear_trajectory_context()
+
+        states = list(await asyncio.gather(*[
+            run_rollout_with_context(i, inp)
+            for i, inp in enumerate(rollout_inputs)
+        ]))
+
+        await vf_builder.vf_env.rubric.score_group(states, score_sem=score_sem)
 
         if group_id is not None:
             rewards = [state.get("reward") or 0.0 for state in states]
@@ -187,7 +193,10 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         log_path=log_path,
         eval_every=cli_config.eval_every,
         save_every=cli_config.save_every,
-        stream_minibatch_config=None,
+        stream_minibatch_config=train.StreamMinibatchConfig(
+            groups_per_batch=cli_config.groups_per_batch,
+            num_minibatches=cli_config.groups_per_batch,
+        ),
         base_url=cli_config.base_url,
     )
 

@@ -160,35 +160,25 @@ class TrajectoryProgressTracker:
                 self._call_counters[group_id] = 0
         self._write_state()
 
-    def track_llm_call(self, group_id: int, tokens: int) -> None:
+    def track_llm_call(self, group_id: int, tokens: int, traj_idx: int) -> None:
         with self._update_lock:
             if group_id not in self._groups:
-                return
+                raise ValueError(f"Unknown group_id: {group_id}")
 
             group = self._groups[group_id]
+
+            if traj_idx not in group.trajectories:
+                raise ValueError(f"Unknown traj_idx: {traj_idx} for group_id: {group_id}")
 
             if group_id not in self._call_counters:
                 self._call_counters[group_id] = 0
 
-            in_progress = [
-                t for t in group.trajectories.values()
-                if t.status == TrajectoryStatus.IN_PROGRESS
-            ]
-            pending = [
-                t for t in group.trajectories.values()
-                if t.status == TrajectoryStatus.PENDING
-            ]
-
-            if pending:
-                traj = pending[0]
+            traj = group.trajectories[traj_idx]
+            if traj.status == TrajectoryStatus.PENDING:
                 traj.status = TrajectoryStatus.IN_PROGRESS
                 traj.start_time = time.time()
-                traj.tokens_generated = tokens
-                traj.num_llm_calls = 1
-            elif in_progress:
-                traj = min(in_progress, key=lambda t: t.num_llm_calls)
-                traj.tokens_generated = tokens  # Latest context size, not cumulative
-                traj.num_llm_calls += 1
+            traj.tokens_generated = tokens
+            traj.num_llm_calls += 1
 
             self._call_counters[group_id] += 1
 
@@ -225,10 +215,9 @@ class TrajectoryProgressTracker:
         self._write_state()
 
 
-def set_trajectory_context(group_id: int, traj_id: int | None = None) -> None:
+def set_trajectory_context(group_id: int, traj_id: int) -> None:
     trajectory_group_id.set(group_id)
-    if traj_id is not None:
-        trajectory_index.set(traj_id)
+    trajectory_index.set(traj_id)
 
 
 def get_trajectory_context() -> tuple[int | None, int | None]:

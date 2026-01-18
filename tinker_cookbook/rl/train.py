@@ -358,6 +358,7 @@ async def do_sync_training_with_stream_minibatch(
             # and the trainer will consume them as soon as they are ready
             trajectory_groups_queue = asyncio.Queue[WrappedTrajectoryGroup | None]()
             env_group_builders_P = dataset.get_batch(i_batch)
+            tracker = TrajectoryProgressTracker.get_instance()
 
             @scope
             async def trajectory_group_worker_task(
@@ -388,29 +389,36 @@ async def do_sync_training_with_stream_minibatch(
 
             # Sample all trajectories asynchronously. If we have multiple minibatches,
             # then sampling can overlap with training.
-            for i, builder in enumerate(env_group_builders_P):
-                asyncio.create_task(
-                    trajectory_group_worker_task(builder, enable_logging=i < cfg.num_groups_to_log),
-                    name=f"trajectory_group_worker_task_{i}",
-                )
+            with tracker.track_batch(len(env_group_builders_P)):
+                for i, builder in enumerate(env_group_builders_P):
+                    builder._progress_group_id = i
+                    asyncio.create_task(
+                        trajectory_group_worker_task(builder, enable_logging=i < cfg.num_groups_to_log),
+                        name=f"trajectory_group_worker_task_{i}",
+                    )
 
-            # Run multiple optimizer substeps per training iteration
-            (
-                sampling_client,
-                full_batch_metrics,
-            ) = await do_train_step_streaming_and_get_sampling_client(
-                cfg,
-                i_batch,
-                trajectory_groups_queue,
-                training_client,
-                service_client,
-                tokenizer,
-            )
+                # Run multiple optimizer substeps per training iteration
+                (
+                    sampling_client,
+                    full_batch_metrics,
+                ) = await do_train_step_streaming_and_get_sampling_client(
+                    cfg,
+                    i_batch,
+                    trajectory_groups_queue,
+                    training_client,
+                    service_client,
+                    tokenizer,
+                )
 
         # Log metrics
         metrics.update(full_batch_metrics)
         metrics["time/total"] = time.time() - t_start
         ml_logger.log_metrics(metrics, step=i_batch)
+
+        # Clean up temporary attributes
+        for builder in env_group_builders_P:
+            if hasattr(builder, "_progress_group_id"):
+                delattr(builder, "_progress_group_id")
 
 
 @chz.chz
@@ -875,6 +883,13 @@ async def do_train_step_streaming_and_get_sampling_client(
             optim_future = await training_client.optim_step_async(adam_params)
 
         # Now consume all forward-backward results
+        # TODO: Add visualization mechanism to show which trajectories have completed fwd_bwd.
+        #       Currently trajectory_progress.py only tracks sampling status (PENDING -> IN_PROGRESS -> COMPLETED).
+        #       We want to add a new state or indicator showing which groups have been sent through
+        #       forward_backward_async and which have had their results consumed. This would let the
+        #       watcher UI (uv run python -m tinker_cookbook.utils.trajectory_progress) display
+        #       training progress alongside sampling progress - e.g., "[+0.5] -> [trained]" or a separate column.
+        #       See: tinker_cookbook/utils/trajectory_progress.py (TrajectoryProgressTracker, GroupState, watch())
         for i_mb, fwd_bwd_future in enumerate(forward_backward_futures):
             with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume", metrics):
                 fwd_bwd_result = await fwd_bwd_future.result_async()

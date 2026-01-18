@@ -394,57 +394,92 @@ def watch():
         return Panel(text, title="Dashboard", border_style="bright_black", padding=(0, 1))
 
     def build_table(state: dict) -> Table:
-        table = Table(title="Trajectory Collection", expand=False, box=None)
-        table.add_column("Group", style="cyan", width=6, no_wrap=True)
-        table.add_column("Trajectories", min_width=60)
-        table.add_column("Done", width=8, justify="right")
-        table.add_column("Time", width=6, justify="right")
-
         groups = state.get("groups", {})
-        max_tokens = state.get("max_tokens", 65536)
+        group_size = state.get("group_size", 8)
+        now = time.time()
+
+        table = Table(title="Trajectory Collection", expand=False, box=None)
+        table.add_column("Grp", style="cyan", width=3, no_wrap=True)
+
+        # Add 4 columns per trajectory: ctx, rwd, age, status
+        for tid in range(group_size):
+            table.add_column(f"ctx", width=3, justify="right", style="dim")
+            table.add_column(f"rwd", width=4, justify="right", style="dim")
+            table.add_column(f"age", width=3, justify="right", style="dim")
+            table.add_column(f"st", width=1, justify="center", style="dim")
+
+        table.add_column("Done", width=5, justify="right")
+        table.add_column("Time", width=5, justify="right")
 
         for gid in sorted(groups.keys(), key=int):
             group = groups[gid]
             trajectories = group.get("trajectories", {})
 
-            text = Text()
+            row: list[str | Text] = [f"G{int(gid):02d}"]
             completed = 0
-            for tid in sorted(trajectories.keys(), key=int):
-                traj = trajectories[tid]
+
+            for tid in range(group_size):
+                traj = trajectories.get(str(tid), trajectories.get(tid, {}))
                 status = traj.get("status", "pending")
                 tokens = traj.get("tokens_generated", 0)
                 reward = traj.get("reward")
                 training_status = traj.get("training_status", "pending")
+                start_time = traj.get("start_time")
+                end_time = traj.get("end_time")
 
+                # Context length in k
                 k = tokens // 1000
+                ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·")
+
+                # Reward
                 if status == "completed":
                     completed += 1
                     if reward is not None:
-                        r = f"{reward:+.1f}" if reward != 0 else "0.0"
+                        rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style="green")
                     else:
-                        r = "?"
-                    text.append(f"[{k:2d}k {r:>4}]", style="green bold")
-                    if training_status == "done":
-                        text.append("T", style="cyan bold")
-                    elif training_status == "enqueued":
-                        text.append("F", style="red bold")
+                        rwd_text = Text("   ?", style="green")
+                    ctx_text.stylize("green")
                 elif status == "in_progress":
-                    text.append(f"[{k:2d}k    ?]", style="blue")
+                    rwd_text = Text("   ?", style="blue")
+                    ctx_text.stylize("blue")
                 else:
-                    text.append("[  ·    ·]", style="dim")
-                text.append(" ")
+                    rwd_text = Text("   ·", style="dim")
 
-            total = len(trajectories)
-            start_time = group.get("start_time")
-            end_time = group.get("end_time")
+                # Time since touched (age in seconds)
+                if end_time:
+                    age = int(now - end_time)
+                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="green")
+                elif start_time:
+                    age = int(now - start_time)
+                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="blue")
+                else:
+                    age_text = Text("  ·", style="dim")
 
-            if start_time:
-                elapsed = (end_time or time.time()) - start_time
+                # Training status
+                if training_status == "done":
+                    st_text = Text("T", style="cyan bold")
+                elif training_status == "enqueued":
+                    st_text = Text("F", style="red bold")
+                else:
+                    st_text = Text("·", style="dim")
+
+                row.extend([ctx_text, rwd_text, age_text, st_text])
+
+            # Global columns
+            total = len(trajectories) if trajectories else group_size
+            grp_start = group.get("start_time")
+            grp_end = group.get("end_time")
+
+            if grp_start:
+                elapsed = (grp_end or now) - grp_start
                 time_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
             else:
                 time_str = "--:--"
 
-            table.add_row(f"G{int(gid):02d}", text, f"{completed}/{total}", time_str)
+            row.append(f"{completed}/{total}")
+            row.append(time_str)
+
+            table.add_row(*row)
 
         return table
 

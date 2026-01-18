@@ -39,6 +39,7 @@ class TrajectoryState:
     reward: float | None = None
     start_time: float | None = None
     end_time: float | None = None
+    last_touched_time: float | None = None
     num_llm_calls: int = 0
     training_status: str = "pending"  # "pending" | "enqueued" | "done"
 
@@ -52,6 +53,7 @@ class TrajectoryState:
             "reward": self.reward,
             "start_time": self.start_time,
             "end_time": self.end_time,
+            "last_touched_time": self.last_touched_time,
             "num_llm_calls": self.num_llm_calls,
             "training_status": self.training_status,
         }
@@ -176,10 +178,12 @@ class TrajectoryProgressTracker:
                 self._call_counters[group_id] = 0
 
             traj = group.trajectories[traj_idx]
+            now = time.time()
             if traj.status == TrajectoryStatus.PENDING:
                 traj.status = TrajectoryStatus.IN_PROGRESS
-                traj.start_time = time.time()
+                traj.start_time = now
             traj.tokens_generated = tokens
+            traj.last_touched_time = now
             traj.num_llm_calls += 1
 
             self._call_counters[group_id] += 1
@@ -371,7 +375,7 @@ def watch():
         text.append(" │ ", style="dim")
         text.append(f"Sampled {stats['completed_trajectories']}/{stats['total_trajectories']}", style="green")
         text.append(" │ ", style="dim")
-        text.append(f"Training F:{stats['training_enqueued']} T:{stats['training_done']}", style="yellow")
+        text.append(f"Training R:{stats['training_enqueued']} D:{stats['training_done']}", style="yellow")
         text.append("\n")
 
         # Row 2: Throughput
@@ -394,6 +398,8 @@ def watch():
         return Panel(text, title="Dashboard", border_style="bright_black", padding=(0, 1))
 
     def build_table(state: dict) -> Table:
+        import numpy as np
+
         groups = state.get("groups", {})
         group_size = state.get("group_size", 8)
         now = time.time()
@@ -411,11 +417,56 @@ def watch():
                 table.add_column("", width=1)  # delimiter column
 
         table.add_column("Done", width=5, justify="right")
+        table.add_column("μRwd", width=5, justify="right")
         table.add_column("Time", width=5, justify="right")
+
+        # First pass: compute mean rewards for all groups
+        group_mean_rewards: dict[str, float | None] = {}
+        group_data: dict[str, dict] = {}
+        for gid in groups.keys():
+            group = groups[gid]
+            trajectories = group.get("trajectories", {})
+            all_rewards = []
+            positive_rewards = []
+            for tid in range(group_size):
+                traj = trajectories.get(str(tid), trajectories.get(tid, {}))
+                r = traj.get("reward")
+                if r is not None:
+                    all_rewards.append(r)
+                    if r > 0:
+                        positive_rewards.append(r)
+            positive_rewards.sort(reverse=True)
+            top3_threshold = positive_rewards[2] if len(positive_rewards) >= 3 else (positive_rewards[-1] if positive_rewards else float('inf'))
+            mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else None
+            group_mean_rewards[gid] = mean_reward
+            group_data[gid] = {"top3_threshold": top3_threshold}
+
+        # Compute histogram bins for mean reward coloring (4 bins: red, yellow, bright_yellow, bright_green)
+        valid_means = [m for m in group_mean_rewards.values() if m is not None]
+        if len(valid_means) >= 2:
+            _, bin_edges = np.histogram(valid_means, bins=4)
+        else:
+            bin_edges = None
+
+        def get_mean_reward_style(mean_val: float | None) -> str:
+            if mean_val is None or bin_edges is None:
+                return "dim"
+            # bin_edges has 5 edges for 4 bins: [e0, e1, e2, e3, e4]
+            # bin 0: [e0, e1) -> red (worst)
+            # bin 1: [e1, e2) -> yellow
+            # bin 2: [e2, e3) -> bright_yellow
+            # bin 3: [e3, e4] -> bright_green (best)
+            styles = ["red", "yellow", "bright_yellow", "bright_green"]
+            for i in range(3):
+                if mean_val < bin_edges[i + 1]:
+                    return styles[i]
+            return styles[3]
 
         for gid in sorted(groups.keys(), key=int):
             group = groups[gid]
             trajectories = group.get("trajectories", {})
+            top3_threshold = group_data[gid]["top3_threshold"]
+            mean_reward = group_mean_rewards[gid]
 
             row: list[str | Text] = [f"G{int(gid):02d}"]
             completed = 0
@@ -426,8 +477,8 @@ def watch():
                 tokens = traj.get("tokens_generated", 0)
                 reward = traj.get("reward")
                 training_status = traj.get("training_status", "pending")
-                start_time = traj.get("start_time")
                 end_time = traj.get("end_time")
+                last_touched_time = traj.get("last_touched_time")
 
                 # Context length in k
                 k = tokens // 1000
@@ -437,9 +488,11 @@ def watch():
                     completed += 1
                     ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
                     if reward is not None:
-                        rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style="bright_green")
+                        is_top3 = reward > 0 and reward >= top3_threshold
+                        rwd_style = "bright_green" if is_top3 else "yellow"
+                        rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style=rwd_style)
                     else:
-                        rwd_text = Text("   ?", style="bright_green")
+                        rwd_text = Text("   ?", style="yellow")
                 elif status == "in_progress":
                     ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
                     rwd_text = Text("   ?", style="bright_cyan bold")
@@ -447,21 +500,23 @@ def watch():
                     ctx_text = Text("  ·", style="dim")
                     rwd_text = Text("   ·", style="dim")
 
-                # Time since touched (age in seconds)
-                if end_time:
+                # Time since last activity (age in seconds)
+                if training_status == "done":
+                    age_text = Text("  ·", style="dim")
+                elif end_time:
                     age = int(now - end_time)
-                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="bright_green")
-                elif start_time:
-                    age = int(now - start_time)
-                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="bright_cyan bold")
+                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="dim")
+                elif last_touched_time:
+                    age = int(now - last_touched_time)
+                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="dim")
                 else:
                     age_text = Text("  ·", style="dim")
 
                 # Training status
                 if training_status == "done":
-                    st_text = Text("T", style="bright_cyan bold")
+                    st_text = Text("D", style="bright_cyan bold")
                 elif training_status == "enqueued":
-                    st_text = Text("F", style="red bold")
+                    st_text = Text("R", style="red bold")
                 else:
                     st_text = Text("·", style="dim")
 
@@ -481,6 +536,11 @@ def watch():
                 time_str = "--:--"
 
             row.append(f"{completed}/{total}")
+            if mean_reward is not None:
+                mean_style = get_mean_reward_style(mean_reward)
+                row.append(Text(f"{mean_reward:+.2f}", style=mean_style))
+            else:
+                row.append(Text("--", style="dim"))
             row.append(time_str)
 
             table.add_row(*row)

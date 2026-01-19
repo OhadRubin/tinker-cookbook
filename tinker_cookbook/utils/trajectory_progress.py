@@ -93,6 +93,7 @@ class TrajectoryProgressTracker:
         self._group_size: int = 8
         self._call_counters: dict[int, int] = {}
         self._batch_start_time: float | None = None
+        self._num_workers: int | None = None
 
     @classmethod
     def get_instance(cls) -> TrajectoryProgressTracker:
@@ -117,6 +118,26 @@ class TrajectoryProgressTracker:
         self._max_tokens = max_tokens
         self._group_size = group_size
         self._enabled = enabled
+
+    @contextmanager
+    def start_continuous(self, num_workers: int) -> Iterator[None]:
+        """Context manager for continuous streaming mode.
+        num_workers indicates expected capacity (max groups in flight).
+        Groups are added/removed dynamically via add_group/remove_group."""
+        if not self._enabled:
+            yield
+            return
+
+        self._num_workers = num_workers
+        self._groups.clear()
+        self._call_counters.clear()
+        self._batch_start_time = time.time()
+        self._write_state()
+        try:
+            yield
+        finally:
+            self._num_workers = None
+            self._write_state()
 
     @contextmanager
     def track_batch(self, num_groups: int) -> Iterator[None]:
@@ -151,6 +172,7 @@ class TrajectoryProgressTracker:
             "batch_start_time": self._batch_start_time,
             "max_tokens": self._max_tokens,
             "group_size": self._group_size,
+            "num_workers": self._num_workers,
             "groups": {k: v.to_dict() for k, v in self._groups.items()},
         }
         try:
@@ -163,6 +185,20 @@ class TrajectoryProgressTracker:
             if group_id in self._groups:
                 self._groups[group_id].start_time = time.time()
                 self._call_counters[group_id] = 0
+        self._write_state()
+
+    def add_group(self, group_id: int) -> None:
+        """Add a new group for continuous tracking (no batch context required).
+        Uses self._group_size from configure()."""
+        with self._update_lock:
+            if group_id not in self._groups:
+                self._groups[group_id] = GroupState(group_id=group_id)
+                for t in range(self._group_size):
+                    self._groups[group_id].trajectories[t] = TrajectoryState(
+                        group_id=group_id,
+                        trajectory_id=t,
+                        max_tokens=self._max_tokens,
+                    )
         self._write_state()
 
     def track_llm_call(self, group_id: int, tokens: int, traj_idx: int) -> None:
@@ -231,6 +267,13 @@ class TrajectoryProgressTracker:
 
         self._write_state()
 
+    def remove_group(self, group_id: int) -> None:
+        """Remove a completed group from tracking."""
+        with self._update_lock:
+            if group_id in self._groups:
+                del self._groups[group_id]
+        self._write_state()
+
     def mark_trajectory_training_enqueued(self, group_id: int, trajectory_id: int) -> None:
         """Called when forward_backward_async is invoked for a trajectory."""
         with self._update_lock:
@@ -238,7 +281,7 @@ class TrajectoryProgressTracker:
                 self._groups[group_id].trajectories[trajectory_id].training_status = "enqueued"
         self._write_state()
 
-    def mark_trajectory_training_done(self, group_id: int, trajectory_id: int) -> None:
+    def mark_trajectory_fwd_bwd_done(self, group_id: int, trajectory_id: int) -> None:
         """Called when forward_backward result is consumed for a trajectory."""
         with self._update_lock:
             if group_id in self._groups and trajectory_id in self._groups[group_id].trajectories:
@@ -366,6 +409,7 @@ def watch():
             "eta_batch_rolling": eta_batch_rolling,
             "eta_traj_overall": eta_traj_overall,
             "eta_traj_rolling": eta_traj_rolling,
+            "num_workers": state.get("num_workers"),
         }
 
     def format_time(seconds: float) -> str:
@@ -382,7 +426,10 @@ def watch():
 
         # Row 1: Progress counts
         text.append("Progress: ", style="bold")
-        text.append(f"Groups {stats['completed_groups']}/{stats['total_groups']}", style="cyan")
+        if stats.get('num_workers'):
+            text.append(f"Groups {stats['total_groups']}/{stats['num_workers']}", style="cyan")
+        else:
+            text.append(f"Groups {stats['total_groups']}", style="cyan")
         text.append(" │ ", style="dim")
         text.append(f"Sampled {stats['completed_trajectories']}/{stats['total_trajectories']}", style="green")
         text.append(" │ ", style="dim")
@@ -413,7 +460,19 @@ def watch():
 
         groups = state.get("groups", {})
         group_size = state.get("group_size", 8)
+        num_workers = state.get("num_workers")
         now = time.time()
+
+        # Limit to num_workers + 10 groups, prioritizing most recently active
+        max_display = num_workers + 10 if num_workers else None
+        if max_display and len(groups) > max_display:
+            def group_sort_key(gid: str) -> float:
+                g = groups[gid]
+                trajs = g.get("trajectories", {})
+                times = [t.get("last_touched_time") or t.get("start_time") or 0 for t in trajs.values()]
+                return max(times) if times else 0
+            sorted_gids = sorted(groups.keys(), key=group_sort_key, reverse=True)
+            groups = {gid: groups[gid] for gid in sorted_gids[:max_display]}
 
         table = Table(title="Trajectory Collection", expand=False, box=None)
         table.add_column("Grp", style="cyan", width=3, no_wrap=True)

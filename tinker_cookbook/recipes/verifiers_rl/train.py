@@ -54,6 +54,11 @@ class CLIConfig:
     max_concurrent_generation: int = -1
     max_concurrent_scoring: int = -1
 
+    # async training configuration
+    async_training: bool = False
+    max_steps_off_policy: int = 1
+    in_flight_ratio: float = 1.0
+
     # logging configuration
     eval_every: int = 0
     save_every: int = 10
@@ -197,10 +202,15 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         log_path=log_path,
         eval_every=cli_config.eval_every,
         save_every=cli_config.save_every,
+        async_config=train.AsyncConfig(
+            max_steps_off_policy=cli_config.max_steps_off_policy,
+            groups_per_batch=cli_config.groups_per_batch,
+            in_flight_ratio=cli_config.in_flight_ratio,
+        ) if cli_config.async_training else None,
         stream_minibatch_config=train.StreamMinibatchConfig(
             groups_per_batch=cli_config.groups_per_batch,
             num_minibatches=cli_config.groups_per_batch,
-        ),
+        ) if not cli_config.async_training else None,
         base_url=cli_config.base_url,
     )
 

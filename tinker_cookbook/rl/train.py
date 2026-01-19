@@ -223,6 +223,9 @@ class AsyncConfig:
     # We will ensure all batches have at least this many groups, even
     # as we discard stale samples
     groups_per_batch: int
+    # Multiplier for how many groups can be in flight relative to groups_per_batch.
+    # E.g., in_flight_ratio=2.0 with groups_per_batch=32 → 64 concurrent sampling workers.
+    in_flight_ratio: float = 1.0
 
 
 @chz.chz
@@ -453,14 +456,16 @@ async def do_async_training(
 ):
     """Implements async off-policy training, capped at K steps off policy."""
     assert cfg.async_config is not None
+    num_workers = int(cfg.async_config.groups_per_batch * cfg.async_config.in_flight_ratio)
 
     shutdown_event = asyncio.Event()
-    # We will have groups_per_batch worker generating rollouts, so cap the
-    # queue size to be groups_per_batch.
+    # We will have num_workers workers generating rollouts, so cap the
+    # queue size to be num_workers.
     env_group_builders_queue = asyncio.Queue[EnvGroupBuilder | None](
-        maxsize=cfg.async_config.groups_per_batch
+        maxsize=num_workers
     )
     trajectory_groups_queue = asyncio.Queue[WrappedTrajectoryGroup | None]()
+    tracker = TrajectoryProgressTracker.get_instance()
 
     # Initial sampling client to use
     path_dict = await checkpoint_utils.save_checkpoint_async(
@@ -481,8 +486,7 @@ async def do_async_training(
     def shutdown_loops():
         """Trigger all loops to shutdown"""
         shutdown_event.set()
-        assert cfg.async_config is not None
-        for _ in range(cfg.async_config.groups_per_batch):
+        for _ in range(num_workers):
             env_group_builders_queue.put_nowait(None)
         sampling_client_updated_event.set()
 
@@ -490,9 +494,13 @@ async def do_async_training(
     async def dataloader_loop():
         """Gets the next set of env builders to run"""
         i_batch = start_batch
+        group_counter = 0
         while not shutdown_event.is_set() and i_batch < end_batch:
             env_group_builders_P = dataset.get_batch(i_batch)
             for env_group_builder in env_group_builders_P:
+                env_group_builder._progress_group_id = group_counter
+                tracker.add_group(group_counter)
+                group_counter += 1
                 await env_group_builders_queue.put(env_group_builder)
             i_batch += 1
 
@@ -619,6 +627,14 @@ async def do_async_training(
                     [g.env_group_builder for g in wrapped_trajectory_groups],
                     [g.trajectory_group for g in wrapped_trajectory_groups],
                 )
+                # Mark training complete and cleanup groups
+                for wg in wrapped_trajectory_groups:
+                    gid = wg.env_group_builder._progress_group_id
+                    for tid in range(len(wg.trajectory_group.trajectories_G)):
+                        tracker.mark_trajectory_fwd_bwd_done(gid, tid)
+                    tracker.remove_group(gid)
+                    if hasattr(wg.env_group_builder, "_progress_group_id"):
+                        delattr(wg.env_group_builder, "_progress_group_id")
             sampling_client_step = i_batch + 1
             sampling_client_updated_event.set()
 
@@ -655,17 +671,18 @@ async def do_async_training(
                 metrics["time/evaluation_loop/total"] = time.time() - t_start
                 ml_logger.log_metrics(metrics, step=sampling_client_eval_step)
 
-    await asyncio.gather(
-        asyncio.create_task(dataloader_loop(), name="dataloader_loop"),
-        *[
-            asyncio.create_task(
-                trajectory_group_worker_loop(), name=f"trajectory_group_worker_loop_{i}"
-            )
-            for i in range(cfg.async_config.groups_per_batch)
-        ],
-        asyncio.create_task(training_loop(), name="training_loop"),
-        asyncio.create_task(evaluation_loop(), name="evaluation_loop"),
-    )
+    with tracker.start_continuous(num_workers):
+        await asyncio.gather(
+            asyncio.create_task(dataloader_loop(), name="dataloader_loop"),
+            *[
+                asyncio.create_task(
+                    trajectory_group_worker_loop(), name=f"trajectory_group_worker_loop_{i}"
+                )
+                for i in range(num_workers)
+            ],
+            asyncio.create_task(training_loop(), name="training_loop"),
+            asyncio.create_task(evaluation_loop(), name="evaluation_loop"),
+        )
 
 
 @scope
@@ -803,19 +820,17 @@ async def do_train_step_streaming_and_get_sampling_client(
     trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool] = lambda _: True,
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     """
-    As soon as we have enough trajectories for a minibatch, we will train on them.
-    This allows us to overlap sampling and training.
+    Overlaps sampling and training using producer/consumer pattern.
+    Producer enqueues forward_backward as groups arrive, consumer processes results concurrently.
     """
     assert cfg.stream_minibatch_config is not None
     assert cfg.stream_minibatch_config.groups_per_batch % cfg.num_substeps == 0, (
         f"{cfg.stream_minibatch_config.groups_per_batch=} must be divisible by {cfg.num_substeps=}"
     )
-    # Number of groups across all minibatches in each optimizer substep
     groups_per_substep = cfg.stream_minibatch_config.groups_per_batch // cfg.num_substeps
     assert groups_per_substep % cfg.stream_minibatch_config.num_minibatches == 0, (
         f"{groups_per_substep} must be divisible by {cfg.stream_minibatch_config.num_minibatches=}"
     )
-    # Number of groups per minibatch in each optimizer substep
     groups_per_minibatch = groups_per_substep // cfg.stream_minibatch_config.num_minibatches
 
     update_scope_context({"step": i_batch})
@@ -824,100 +839,91 @@ async def do_train_step_streaming_and_get_sampling_client(
     tracker = TrajectoryProgressTracker.get_instance()
 
     # Run multiple optimizer substeps per training iteration
-    all_data_D = []
-    all_training_logprobs_D = []
-    all_wrapped_trajectory_groups = []
+    all_data_D: list[tinker.Datum] = []
+    all_training_logprobs_D: list[torch.Tensor] = []
+    all_wrapped_trajectory_groups: list[WrappedTrajectoryGroup] = []
+
     for i_substep in range(cfg.num_substeps):
-        # Run multiple minibatches per substep
-        # Once we have enough trajectories for a minibatch, train on them
-        wrapped_trajectory_groups = []
-        forward_backward_futures: list[tinker.APIFuture[tinker.ForwardBackwardOutput]] = []
-        minibatch_trajectories: list[list[tuple[int, int]]] = []  # [(group_id, traj_id), ...]
-        consumed_count = 0  # Track how many futures we've already consumed
-        i_minibatch = 0
-        while i_minibatch < cfg.stream_minibatch_config.num_minibatches:
-            wrapped_trajectory_group = await trajectory_groups_queue.get()
-            if not trajectory_group_filter(wrapped_trajectory_group):
-                continue
-            wrapped_trajectory_groups.append(wrapped_trajectory_group)
+        substep_gids: set[int] = set()
+        fwd_bwd_queue: asyncio.Queue[
+            tuple[tinker.APIFuture[tinker.ForwardBackwardOutput], list[tuple[int, int]], list[tinker.Datum]] | None
+        ] = asyncio.Queue()
 
-            if len(wrapped_trajectory_groups) < groups_per_minibatch:
-                continue
-            logger.info(
-                f"[stream_minibatch] Step {i_batch}, Substep {i_substep}/{cfg.num_substeps}, Minibatch {i_minibatch}/{cfg.stream_minibatch_config.num_minibatches}: Will train on minibatch, num groups: {len(wrapped_trajectory_groups)}"
-            )
+        async def producer():
+            i_group = 0
+            minibatch_wgs: list[WrappedTrajectoryGroup] = []
 
-            # Note: we may have removed trajectory groups that have the same reward.
-            # To have the same results as the sync implementation, we will
-            # remove these and train on a smaller batch.
-            wrapped_trajectory_groups = [g for g in wrapped_trajectory_groups if g is not None]
-            if len(wrapped_trajectory_groups) == 0:
-                i_minibatch += 1
-                continue
+            while i_group < groups_per_substep:
+                wg = await trajectory_groups_queue.get()
+                if not trajectory_group_filter(wg):
+                    continue
 
-            data_D, prepare_minibatch_metrics = await prepare_minibatch(
-                [g.env_group_builder for g in wrapped_trajectory_groups],
-                [g.trajectory_group for g in wrapped_trajectory_groups],
-                tokenizer,
-                service_client,
-                model_name=cfg.model_name,
-                kl_penalty_coef=cfg.kl_penalty_coef,
-                kl_discount_factor=cfg.kl_discount_factor,
-            )
-            metrics.update(prepare_minibatch_metrics)
+                minibatch_wgs.append(wg)
+                i_group += 1
 
-            # Track (group_id, trajectory_id) pairs in this minibatch
-            trajectories_in_minibatch: list[tuple[int, int]] = []
-            for wg in wrapped_trajectory_groups:
-                if hasattr(wg.env_group_builder, "_progress_group_id"):
-                    gid = wg.env_group_builder._progress_group_id
-                    for tid in range(len(wg.trajectory_group.trajectories_G)):
-                        trajectories_in_minibatch.append((gid, tid))
-            minibatch_trajectories.append(trajectories_in_minibatch)
+                if len(minibatch_wgs) < groups_per_minibatch:
+                    continue
 
-            # Enqueue forward-backward (we'll await results after all minibatches are enqueued)
-            with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_enqueue", metrics):
-                for gid, tid in trajectories_in_minibatch:
-                    tracker.mark_trajectory_training_enqueued(gid, tid)
-                forward_backward_futures.append(
-                    await training_client.forward_backward_async(
-                        [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
-                    )
+                # Prepare and enqueue this minibatch
+                data_D, prepare_minibatch_metrics = await prepare_minibatch(
+                    [g.env_group_builder for g in minibatch_wgs],
+                    [g.trajectory_group for g in minibatch_wgs],
+                    tokenizer,
+                    service_client,
+                    model_name=cfg.model_name,
+                    kl_penalty_coef=cfg.kl_penalty_coef,
+                    kl_discount_factor=cfg.kl_discount_factor,
                 )
+                metrics.update(prepare_minibatch_metrics)
 
-            # Consume any ready results immediately (interleaved with enqueuing)
-            while consumed_count < len(forward_backward_futures):
-                if not forward_backward_futures[consumed_count].future().done():
-                    break
-                with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{consumed_count}_consume", metrics):
-                    fwd_bwd_result = await forward_backward_futures[consumed_count].result_async()
-                    all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
-                for gid, tid in minibatch_trajectories[consumed_count]:
-                    tracker.mark_trajectory_training_done(gid, tid)
-                consumed_count += 1
+                trajectories: list[tuple[int, int]] = []
+                for mb_wg in minibatch_wgs:
+                    if hasattr(mb_wg.env_group_builder, "_progress_group_id"):
+                        gid = mb_wg.env_group_builder._progress_group_id
+                        substep_gids.add(gid)
+                        for tid in range(len(mb_wg.trajectory_group.trajectories_G)):
+                            trajectories.append((gid, tid))
+                            tracker.mark_trajectory_training_enqueued(gid, tid)
 
-            all_data_D.extend(data_D)
-            all_wrapped_trajectory_groups.extend(wrapped_trajectory_groups)
-            i_minibatch += 1
-            wrapped_trajectory_groups = []
+                future = await training_client.forward_backward_async(
+                    [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
+                )
+                await fwd_bwd_queue.put((future, trajectories, data_D))
+                all_wrapped_trajectory_groups.extend(minibatch_wgs)
+                minibatch_wgs = []
 
-        # Enqueue optim_step before awaiting results (so they land on same clock cycle)
-        adam_params = tinker.AdamParams(
-            learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
-        )
-        with timed(f"train/optim_substep_{i_substep}_enqueue", metrics):
+            # Enqueue optim_step after all forward_backward
+            adam_params = tinker.AdamParams(
+                learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
+            )
             optim_future = await training_client.optim_step_async(adam_params)
+            await fwd_bwd_queue.put(None)
+            return optim_future
 
-        # Consume remaining forward-backward results (those not yet consumed during enqueuing)
-        for i_mb in range(consumed_count, len(forward_backward_futures)):
-            with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume", metrics):
-                fwd_bwd_result = await forward_backward_futures[i_mb].result_async()
-                all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
-            for gid, tid in minibatch_trajectories[i_mb]:
-                tracker.mark_trajectory_training_done(gid, tid)
+        async def consumer() -> None:
+            while True:
+                item = await fwd_bwd_queue.get()
+                if item is None:
+                    break
+                future, trajectories, data_D = item
+                result = await future.result_async()
+                all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(result))
+                all_data_D.extend(data_D)
+                for gid, tid in trajectories:
+                    tracker.mark_trajectory_fwd_bwd_done(gid, tid)
+
+        producer_task = asyncio.create_task(producer())
+        consumer_task = asyncio.create_task(consumer())
+
+        await consumer_task
+        optim_future = await producer_task
 
         with timed(f"train/optim_substep_{i_substep}_consume", metrics):
             await optim_future.result_async()
+
+        # Remove groups after optim completes
+        for gid in substep_gids:
+            tracker.remove_group(gid)
 
     # Aggregate metrics across the entire batch
     metrics.update(compute_sampling_client_metrics(all_wrapped_trajectory_groups))

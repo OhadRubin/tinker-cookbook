@@ -94,6 +94,7 @@ class TrajectoryProgressTracker:
         self._call_counters: dict[int, int] = {}
         self._batch_start_time: float | None = None
         self._num_workers: int | None = None
+        self._next_group_id: int = 0
 
     @classmethod
     def get_instance(cls) -> TrajectoryProgressTracker:
@@ -131,6 +132,7 @@ class TrajectoryProgressTracker:
         self._num_workers = num_workers
         self._groups.clear()
         self._call_counters.clear()
+        self._next_group_id = 0
         self._batch_start_time = time.time()
         self._write_state()
         try:
@@ -200,6 +202,21 @@ class TrajectoryProgressTracker:
                         max_tokens=self._max_tokens,
                     )
         self._write_state()
+
+    def allocate_group_id(self) -> int:
+        """Allocate and return a new group ID, then add the group to tracking."""
+        with self._update_lock:
+            group_id = self._next_group_id
+            self._next_group_id += 1
+            self._groups[group_id] = GroupState(group_id=group_id)
+            for t in range(self._group_size):
+                self._groups[group_id].trajectories[t] = TrajectoryState(
+                    group_id=group_id,
+                    trajectory_id=t,
+                    max_tokens=self._max_tokens,
+                )
+        self._write_state()
+        return group_id
 
     def track_llm_call(self, group_id: int, tokens: int, traj_idx: int) -> None:
         with self._update_lock:

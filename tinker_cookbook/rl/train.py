@@ -494,13 +494,10 @@ async def do_async_training(
     async def dataloader_loop():
         """Gets the next set of env builders to run"""
         i_batch = start_batch
-        group_counter = 0
         while not shutdown_event.is_set() and i_batch < end_batch:
             env_group_builders_P = dataset.get_batch(i_batch)
             for env_group_builder in env_group_builders_P:
-                env_group_builder._progress_group_id = group_counter
-                tracker.add_group(group_counter)
-                group_counter += 1
+                env_group_builder._progress_group_id = tracker.allocate_group_id()
                 await env_group_builders_queue.put(env_group_builder)
             i_batch += 1
 
@@ -511,6 +508,10 @@ async def do_async_training(
             env_group_builder = await env_group_builders_queue.get()
             if env_group_builder is None:
                 break
+
+            # Allocate new group ID for requeued builders (stale ones have ID deleted)
+            if not hasattr(env_group_builder, "_progress_group_id"):
+                env_group_builder._progress_group_id = tracker.allocate_group_id()
 
             metrics = {}
             t_start = time.time()
@@ -568,6 +569,11 @@ async def do_async_training(
                     > cfg.async_config.max_steps_off_policy
                 ):
                     logger.info(f"[training_loop] Step {i_batch}: Samples are too stale, skipping")
+                    # Remove stale group from tracker and clear ID so it gets reallocated
+                    if hasattr(wrapped_trajectory_group.env_group_builder, "_progress_group_id"):
+                        gid = wrapped_trajectory_group.env_group_builder._progress_group_id
+                        tracker.remove_group(gid)
+                        delattr(wrapped_trajectory_group.env_group_builder, "_progress_group_id")
                     asyncio.create_task(
                         env_group_builders_queue.put(wrapped_trajectory_group.env_group_builder),
                         name="requeue_stale_sample_task",

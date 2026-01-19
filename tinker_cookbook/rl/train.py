@@ -618,6 +618,11 @@ async def do_async_training(
 
                 # TODO: For proper checkpointing, we also need to save dataloader state and
                 # all queued trajectory groups that haven't been trained on yet
+                for wg in wrapped_trajectory_groups:
+                    gid = wg.env_group_builder._progress_group_id
+                    for tid in range(len(wg.trajectory_group.trajectories_G)):
+                        tracker.mark_trajectory_training_enqueued(gid, tid)
+
                 sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
                     cfg,
                     i_batch,

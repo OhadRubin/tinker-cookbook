@@ -463,16 +463,11 @@ def watch():
         num_workers = state.get("num_workers")
         now = time.time()
 
-        # Limit to num_workers + 10 groups, prioritizing most recently active
+        # Limit to num_workers + 10 groups, keeping lowest group IDs (actively being processed)
         max_display = num_workers + 10 if num_workers else None
         if max_display and len(groups) > max_display:
-            def group_sort_key(gid: str) -> float:
-                g = groups[gid]
-                trajs = g.get("trajectories", {})
-                times = [t.get("last_touched_time") or t.get("start_time") or 0 for t in trajs.values()]
-                return max(times) if times else 0
-            sorted_gids = sorted(groups.keys(), key=group_sort_key, reverse=True)
-            groups = {gid: groups[gid] for gid in sorted_gids[:max_display]}
+            sorted_gids = sorted(groups.keys(), key=int)[:max_display]
+            groups = {gid: groups[gid] for gid in sorted_gids}
 
         table = Table(title="Trajectory Collection", expand=False, box=None)
         table.add_column("Grp", style="cyan", width=3, no_wrap=True)

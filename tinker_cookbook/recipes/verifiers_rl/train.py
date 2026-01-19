@@ -210,7 +210,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         stream_minibatch_config=train.StreamMinibatchConfig(
             groups_per_batch=cli_config.groups_per_batch,
             num_minibatches=cli_config.groups_per_batch,
-        ) if not cli_config.async_training else None,
+        ),
         base_url=cli_config.base_url,
     )
 

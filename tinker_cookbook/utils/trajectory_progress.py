@@ -124,7 +124,7 @@ class TrajectoryProgressTracker:
     def start_continuous(self, num_workers: int) -> Iterator[None]:
         """Context manager for continuous streaming mode.
         num_workers indicates expected capacity (max groups in flight).
-        Groups are added/removed dynamically via add_group/remove_group."""
+        Groups are created lazily on first track_llm_call and removed via remove_group."""
         if not self._enabled:
             yield
             return
@@ -151,16 +151,6 @@ class TrajectoryProgressTracker:
         self._groups.clear()
         self._call_counters.clear()
         self._batch_start_time = time.time()
-
-        for g in range(num_groups):
-            self._groups[g] = GroupState(group_id=g)
-            for t in range(self._group_size):
-                self._groups[g].trajectories[t] = TrajectoryState(
-                    group_id=g,
-                    trajectory_id=t,
-                    max_tokens=self._max_tokens,
-                )
-
         self._write_state()
         try:
             yield
@@ -182,54 +172,35 @@ class TrajectoryProgressTracker:
         except Exception:
             pass
 
-    def start_group(self, group_id: int) -> None:
-        with self._update_lock:
-            if group_id in self._groups:
-                self._groups[group_id].start_time = time.time()
-                self._call_counters[group_id] = 0
-        self._write_state()
+    def _create_group(self, group_id: int, start_time: float | None) -> None:
+        """Create a group with all trajectories. Must be called with _update_lock held."""
+        self._groups[group_id] = GroupState(group_id=group_id, start_time=start_time)
+        for t in range(self._group_size):
+            self._groups[group_id].trajectories[t] = TrajectoryState(
+                group_id=group_id,
+                trajectory_id=t,
+                max_tokens=self._max_tokens,
+            )
 
-    def add_group(self, group_id: int) -> None:
-        """Add a new group for continuous tracking (no batch context required).
-        Uses self._group_size from configure()."""
+    @contextmanager
+    def _maybe_create_group(self, group_id: int) -> Iterator[GroupState]:
+        """Acquire lock, create group if it doesn't exist, then yield it."""
         with self._update_lock:
             if group_id not in self._groups:
-                self._groups[group_id] = GroupState(group_id=group_id)
-                for t in range(self._group_size):
-                    self._groups[group_id].trajectories[t] = TrajectoryState(
-                        group_id=group_id,
-                        trajectory_id=t,
-                        max_tokens=self._max_tokens,
-                    )
-        self._write_state()
+                self._create_group(group_id, start_time=time.time())
+                self._call_counters[group_id] = 0
+            yield self._groups[group_id]
 
     def allocate_group_id(self) -> int:
-        """Allocate and return a new group ID, then add the group to tracking."""
+        """Allocate and return a new group ID. Group is created lazily on first track_llm_call."""
         with self._update_lock:
             group_id = self._next_group_id
             self._next_group_id += 1
-            self._groups[group_id] = GroupState(group_id=group_id)
-            for t in range(self._group_size):
-                self._groups[group_id].trajectories[t] = TrajectoryState(
-                    group_id=group_id,
-                    trajectory_id=t,
-                    max_tokens=self._max_tokens,
-                )
-        self._write_state()
         return group_id
 
     def track_llm_call(self, group_id: int, tokens: int, traj_idx: int) -> None:
-        with self._update_lock:
-            if group_id not in self._groups:
-                raise ValueError(f"Unknown group_id: {group_id}")
-
-            group = self._groups[group_id]
-
-            if traj_idx not in group.trajectories:
-                raise ValueError(f"Unknown traj_idx: {traj_idx} for group_id: {group_id}")
-
-            if group_id not in self._call_counters:
-                self._call_counters[group_id] = 0
+        with self._maybe_create_group(group_id) as group:
+            assert traj_idx in group.trajectories, f"traj_idx={traj_idx} not in group_id={group_id}"
 
             traj = group.trajectories[traj_idx]
             now = time.time()
@@ -244,65 +215,47 @@ class TrajectoryProgressTracker:
 
         self._write_state()
 
-    def complete_trajectory(
-        self, group_id: int, trajectory_id: int, reward: float, total_tokens: int
-    ) -> None:
-        with self._update_lock:
-            if group_id in self._groups and trajectory_id in self._groups[group_id].trajectories:
-                traj = self._groups[group_id].trajectories[trajectory_id]
-                traj.status = TrajectoryStatus.COMPLETED
-                traj.reward = reward
-                traj.tokens_generated = total_tokens
-                traj.end_time = time.time()
-        self._write_state()
-
     def mark_trajectory_sampled(self, group_id: int, trajectory_id: int, total_tokens: int) -> None:
         """Called when a trajectory finishes sampling but hasn't been scored yet."""
-        with self._update_lock:
-            if group_id in self._groups and trajectory_id in self._groups[group_id].trajectories:
-                traj = self._groups[group_id].trajectories[trajectory_id]
-                traj.status = TrajectoryStatus.SAMPLED
-                traj.tokens_generated = total_tokens
-                traj.end_time = time.time()
+        with self._maybe_create_group(group_id) as group:
+            assert trajectory_id in group.trajectories, f"trajectory_id={trajectory_id} not in group_id={group_id}"
+            traj = group.trajectories[trajectory_id]
+            traj.status = TrajectoryStatus.SAMPLED
+            traj.tokens_generated = total_tokens
+            traj.end_time = time.time()
         self._write_state()
 
-    def complete_group(self, group_id: int, rewards: list[float], token_counts: list[int]) -> None:
-        with self._update_lock:
-            if group_id not in self._groups:
-                return
-
-            group = self._groups[group_id]
+    def complete_group(self, group_id: int, rewards: list[float]) -> None:
+        with self._maybe_create_group(group_id) as group:
             group.end_time = time.time()
 
-            for i, (reward, tokens) in enumerate(zip(rewards, token_counts)):
-                if i in group.trajectories:
-                    traj = group.trajectories[i]
-                    traj.status = TrajectoryStatus.COMPLETED
-                    traj.reward = reward
-                    traj.tokens_generated = tokens
-                    traj.end_time = time.time()
+            for i, reward in enumerate(rewards):
+                assert i in group.trajectories, f"trajectory_id={i} not in group_id={group_id}"
+                traj = group.trajectories[i]
+                traj.status = TrajectoryStatus.COMPLETED
+                traj.reward = reward
+                traj.end_time = time.time()
 
         self._write_state()
 
     def remove_group(self, group_id: int) -> None:
         """Remove a completed group from tracking."""
-        with self._update_lock:
-            if group_id in self._groups:
-                del self._groups[group_id]
+        with self._maybe_create_group(group_id) as group:
+            del self._groups[group_id]
         self._write_state()
 
     def mark_trajectory_training_enqueued(self, group_id: int, trajectory_id: int) -> None:
         """Called when forward_backward_async is invoked for a trajectory."""
-        with self._update_lock:
-            if group_id in self._groups and trajectory_id in self._groups[group_id].trajectories:
-                self._groups[group_id].trajectories[trajectory_id].training_status = "enqueued"
+        with self._maybe_create_group(group_id) as group:
+            assert trajectory_id in group.trajectories, f"trajectory_id={trajectory_id} not in group_id={group_id}"
+            group.trajectories[trajectory_id].training_status = "enqueued"
         self._write_state()
 
     def mark_trajectory_fwd_bwd_done(self, group_id: int, trajectory_id: int) -> None:
         """Called when forward_backward result is consumed for a trajectory."""
-        with self._update_lock:
-            if group_id in self._groups and trajectory_id in self._groups[group_id].trajectories:
-                self._groups[group_id].trajectories[trajectory_id].training_status = "done"
+        with self._maybe_create_group(group_id) as group:
+            assert trajectory_id in group.trajectories, f"trajectory_id={trajectory_id} not in group_id={group_id}"
+            group.trajectories[trajectory_id].training_status = "done"
         self._write_state()
 
 

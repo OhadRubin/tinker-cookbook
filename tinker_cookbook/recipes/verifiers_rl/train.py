@@ -29,6 +29,47 @@ from tinker_cookbook.utils.trajectory_progress import (
 logger = logging.getLogger(__name__)
 
 
+def extract_num_tokens_from_state(state: vf.State) -> Dict[str, int]:
+    """Extract token counts from the last step in trajectory.
+
+    Reads state["trajectory"][-1]["response"].usage to get token counts.
+
+    Args:
+        state: Verifiers state with trajectory containing response objects
+
+    Returns:
+        Dict with prompt_tokens, completion_tokens, and total_tokens.
+
+    Raises:
+        ValueError: If trajectory is empty or missing required data
+    """
+    trajectory = state.get("trajectory", [])
+    if not trajectory:
+        raise ValueError("Trajectory is empty, cannot extract token counts")
+    last_step = trajectory[-1]
+    response = last_step.get("response")
+    if response is None:
+        raise ValueError("Last trajectory step has no response")
+
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        raise ValueError("Response has no usage information")
+
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    if prompt_tokens is None:
+        raise ValueError("Usage has no prompt_tokens")
+
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if completion_tokens is None:
+        raise ValueError("Usage has no completion_tokens")
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
 @chz.chz
 class CLIConfig:
     # model configuration
@@ -121,11 +162,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         gen_sem = shared_gen_sem
         score_sem = shared_score_sem
 
-        group_id = getattr(builder, "_progress_group_id", None)
+        group_id: int = builder._progress_group_id
         tracker = TrajectoryProgressTracker.get_instance()
-
-        if group_id is not None:
-            tracker.start_group(group_id)
 
         gen_sampling_args = {
             "max_tokens": cli_config.max_tokens,
@@ -133,15 +171,16 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         }
 
         async def run_rollout_with_context(traj_idx: int, rollout_input):
-            if group_id is not None:
-                set_trajectory_context(group_id, traj_idx)
+            set_trajectory_context(group_id, traj_idx)
             try:
-                return await vf_builder.vf_env.run_rollout(
+                result = await vf_builder.vf_env.run_rollout(
                     gen_sem, rollout_input, shared_client, "tinker", gen_sampling_args
                 )
+                token_counts = extract_num_tokens_from_state(result)
+                tracker.mark_trajectory_sampled(group_id, traj_idx, token_counts["total_tokens"])
+                return result
             finally:
-                if group_id is not None:
-                    clear_trajectory_context()
+                clear_trajectory_context()
 
         states = list(await asyncio.gather(*[
             run_rollout_with_context(i, inp)
@@ -150,22 +189,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
 
         await vf_builder.vf_env.rubric.score_group(states, score_sem=score_sem)
 
-        if group_id is not None:
-            rewards = [state.get("reward") or 0.0 for state in states]
-            context_lengths = []
-            for state in states:
-                trajectory = state.get("trajectory", [])
-                if trajectory:
-                    last_step = trajectory[-1]
-                    tokens_data = last_step.get("tokens")
-                    if tokens_data:
-                        # TODO: add completion tokens too
-                        context_lengths.append(len(tokens_data.get("prompt_ids", [])))
-                    else:
-                        context_lengths.append(0)
-                else:
-                    context_lengths.append(0)
-            tracker.complete_group(group_id, rewards, context_lengths)
+        rewards = [state.get("reward") or 0.0 for state in states]
+        tracker.complete_group(group_id, rewards)
 
         return convert_states_to_trajectory_group(states)
 

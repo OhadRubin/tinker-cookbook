@@ -65,6 +65,7 @@ async def evaluate(
     rollouts_per_example: int,
     max_concurrent: int,
     max_tokens: int,
+    max_context_length: int,
     temperature: float,
     model_path: str | None = None,
 ):
@@ -96,7 +97,7 @@ async def evaluate(
     else:
         sampling = service.create_sampling_client(base_model=model_name)
 
-    client = TinkerAsyncOpenAIClient(sampling, renderer, tokenizer)
+    client = TinkerAsyncOpenAIClient(sampling, renderer, tokenizer, max_context_length)
     start_time = time.time()
     results = env.evaluate_sync(
         client=client,
@@ -131,6 +132,7 @@ class CLIConfig:
     rollouts_per_example: int = 3
     max_concurrent: int = 32
     max_tokens: int = 1024
+    max_context_length: int
     temperature: float = 1.0
 
 
@@ -144,6 +146,7 @@ async def cli_main(cfg: CLIConfig):
         rollouts_per_example=cfg.rollouts_per_example,
         max_concurrent=cfg.max_concurrent,
         max_tokens=cfg.max_tokens,
+        max_context_length=cfg.max_context_length,
         temperature=cfg.temperature,
         model_path=cfg.model_path,
     )

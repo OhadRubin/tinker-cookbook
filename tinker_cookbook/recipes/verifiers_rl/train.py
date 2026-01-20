@@ -90,6 +90,7 @@ class CLIConfig:
     num_substeps: int = 1
     learning_rate: float = 1e-5
     max_tokens: int = 512
+    max_context_length: int
     temperature: float = 1.0
     kl_penalty_coef: float = 0.0
     max_concurrent_generation: int = -1
@@ -147,7 +148,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         sampling_client = cast(TinkerTokenCompleter, policy).sampling_client
         if shared_client is None:
             shared_client = TinkerAsyncOpenAIClient(
-                sampling_client, shared_renderer, local_tokenizer
+                sampling_client, shared_renderer, local_tokenizer, cli_config.max_context_length
             )
         else:
             shared_client.set_sampling_client(sampling_client)
@@ -174,7 +175,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
             set_trajectory_context(group_id, traj_idx)
             try:
                 result = await vf_builder.vf_env.run_rollout(
-                    gen_sem, rollout_input, shared_client, "tinker", gen_sampling_args
+                    rollout_input, shared_client, "tinker", gen_sampling_args, gen_sem
                 )
                 token_counts = extract_num_tokens_from_state(result)
                 tracker.mark_trajectory_sampled(group_id, traj_idx, token_counts["total_tokens"])

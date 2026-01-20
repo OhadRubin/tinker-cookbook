@@ -28,7 +28,7 @@ dependencies = [
     "math-verify",
     "scipy",
     "wandb",
-    "verifiers>=0.1.8.post0",
+    "verifiers>=0.1.9.post3",
     "openai",
     "tqdm>=4.67.1",
 ]
@@ -60,7 +60,7 @@ trackio = [
     "trackio<1.0.0",
 ]
 verifiers = [
-    "verifiers>=0.1.8.post0",
+    "verifiers>=0.1.9.post3",
     "openai",
 ]
 all = [

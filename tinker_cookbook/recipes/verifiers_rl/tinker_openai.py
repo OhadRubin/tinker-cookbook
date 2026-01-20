@@ -10,11 +10,28 @@ Returns OpenAI types (ChatCompletion / Completion) constructed from sampled toke
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from typing import Any, Dict, List, Literal, overload
 
 import tinker
+import verifiers as vf
 from openai import AsyncOpenAI
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_never,
+    wait_fixed,
+)
+from tinker import BadRequestError
+
+# Must match the prefix in tx.tinker.extra.external_inference
+TIMEOUT_ERROR_PREFIX = "TINKER_TIMEOUT: "
+SAMPLING_TIMEOUT_SECONDS = 180
+SAMPLING_TIMEOUT_INCREMENT = 30
+
+logger = logging.getLogger(__name__)
 
 from tinker_cookbook.utils.trajectory_progress import (
     TrajectoryProgressTracker,
@@ -31,6 +48,45 @@ from tinker_cookbook import renderers
 from tinker_cookbook.tokenizer_utils import Tokenizer
 
 
+class SamplingTimeoutError(Exception):
+    """Raised when sampling times out (client-side or server-side)."""
+    pass
+
+
+async def sample_with_retries(
+    sampling_client: tinker.SamplingClient,
+    prompt: tinker.ModelInput,
+    sampling_params: tinker.SamplingParams,
+) -> tinker.SampleResponse:
+    """Sample with tenacity retries and linearly increasing timeout. Never raises."""
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception_type(SamplingTimeoutError),
+        stop=stop_never,
+        wait=wait_fixed(0),
+    ):
+        with attempt:
+            attempt_number = attempt.retry_state.attempt_number
+            timeout = SAMPLING_TIMEOUT_SECONDS + (attempt_number - 1) * SAMPLING_TIMEOUT_INCREMENT
+            try:
+                sample = await asyncio.wait_for(
+                    sampling_client.sample_async(
+                        prompt=prompt,
+                        num_samples=1,
+                        sampling_params=sampling_params,
+                    ),
+                    timeout=timeout,
+                )
+                return sample
+            except asyncio.TimeoutError:
+                logger.warning(f"Client-side timeout ({timeout}s) on attempt {attempt_number}, retrying...")
+                raise SamplingTimeoutError()
+            except BadRequestError as e:
+                # if TIMEOUT_ERROR_PREFIX not in e.message:
+                #     raise
+                logger.warning(f"Server-side timeout on attempt {attempt_number}, retrying...")
+                raise SamplingTimeoutError()
+
+
 class TinkerAsyncOpenAIClient(AsyncOpenAI):
     """
     OpenAI-compatible async client that routes calls to a Tinker SamplingClient.
@@ -41,11 +97,13 @@ class TinkerAsyncOpenAIClient(AsyncOpenAI):
         sampling_client: tinker.SamplingClient,
         renderer: renderers.Renderer,
         tokenizer: Tokenizer,
+        max_context_length: int,
     ) -> None:
         super().__init__(api_key="tinker", base_url="http://localhost")
         self.sampling_client = sampling_client
         self.renderer = renderer
         self.tokenizer = tokenizer
+        self.max_context_length = max_context_length
 
     def set_sampling_client(self, sampling_client: tinker.SamplingClient) -> None:
         self.sampling_client = sampling_client
@@ -102,17 +160,27 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             model_input = renderer.build_generation_prompt(messages)
             prompt_token_ids: List[int] = model_input.to_ints()
 
-            sample = await self._parent.sampling_client.sample_async(
+            effective_max_tokens = int(max_tokens or 128)
+            total_tokens = len(prompt_token_ids) + effective_max_tokens
+            if total_tokens > self._parent.max_context_length:
+                raise vf.OverlongPromptError(
+                    f"Request exceeds max context length: "
+                    f"{len(prompt_token_ids)} prompt tokens + {effective_max_tokens} max_tokens = "
+                    f"{total_tokens} > {self._parent.max_context_length}"
+                )
+
+            sample = await sample_with_retries(
+                self._parent.sampling_client,
                 prompt=model_input,
-                num_samples=1,
                 sampling_params=tinker.SamplingParams(
                     temperature=float(sampling_args.get("temperature", 1.0)),
-                    max_tokens=int(max_tokens or 128),
+                    max_tokens=effective_max_tokens,
                     top_p=float(sampling_args.get("top_p", 1.0)),
                     top_k=int(sampling_args.get("top_k", -1)),
                     stop=stop,
                 ),
             )
+
             seq = sample.sequences[0]
             completion_token_ids: List[int] = seq.tokens
             logprobs: List[float] = seq.logprobs or [0.0] * len(completion_token_ids)
@@ -210,16 +278,26 @@ class TinkerCompletions(OpenAIAsyncCompletions):
         prompt_token_ids: List[int] = self._parent.tokenizer.encode(prompt, add_special_tokens=True)
         model_input = tinker.ModelInput.from_ints(prompt_token_ids)
 
-        sample = await self._parent.sampling_client.sample_async(
+        effective_max_tokens = int(sampling_args.get("max_tokens", 128))
+        total_tokens = len(prompt_token_ids) + effective_max_tokens
+        if total_tokens > self._parent.max_context_length:
+            raise vf.OverlongPromptError(
+                f"Request exceeds max context length: "
+                f"{len(prompt_token_ids)} prompt tokens + {effective_max_tokens} max_tokens = "
+                f"{total_tokens} > {self._parent.max_context_length}"
+            )
+
+        sample = await sample_with_retries(
+            self._parent.sampling_client,
             prompt=model_input,
-            num_samples=1,
             sampling_params=tinker.SamplingParams(
                 temperature=float(sampling_args.get("temperature", 1.0)),
-                max_tokens=int(sampling_args.get("max_tokens", 128)),
+                max_tokens=effective_max_tokens,
                 top_p=float(sampling_args.get("top_p", 1.0)),
                 top_k=int(sampling_args.get("top_k", -1)),
             ),
         )
+
         seq = sample.sequences[0]
         completion_token_ids: List[int] = seq.tokens
         logprobs: List[float] = seq.logprobs or [0.0] * len(completion_token_ids)

@@ -2764,7 +2764,7 @@ wheels = [
 
 [[package]]
 name = "prime-sandboxes"
-version = "0.2.7"
+version = "0.2.11"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -2772,9 +2772,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "tenacity" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/08/b6/5acc211831acd3670f2d8d02bb8f75c2ff47999958393b1005bf250821d8/prime_sandboxes-0.2.7.tar.gz", hash = "sha256:1bd6f70a5be14ac1366ee96d0c3bb2a80521fdeeee7bca8453a95140bcac0e25", size = 45095, upload-time = "2025-12-19T11:53:10.539Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/99/79/af903ac6a05c8c3cbddda4ff21f805696bc5cbfc4d0d9fc18d94bbdc6056/prime_sandboxes-0.2.11.tar.gz", hash = "sha256:82d5174aeb3966b9dc98ce64598a2d1a0ad34315e1702820576ee0922712cbf6", size = 46749, upload-time = "2026-01-17T21:08:32.299Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/11/bf9f7732a0ed6ef9665cbd5d6ff4f074ee0032e2ba0e4574ee8a65a97efa/prime_sandboxes-0.2.7-py3-none-any.whl", hash = "sha256:ac32e0d78d9655378548b627f9cdffd68d8116c36f596297ad7224d920f219b2", size = 18310, upload-time = "2025-12-19T11:53:09.627Z" },
+    { url = "https://files.pythonhosted.org/packages/03/6d/83df0638f35c9380ab494cc197622e8652422a78ddeecd6e8000c8cd8e3d/prime_sandboxes-0.2.11-py3-none-any.whl", hash = "sha256:3218302a1a2a15a6b27c8d9e0446d34fe25e040fb310121b721635506f57452f", size = 20113, upload-time = "2026-01-17T21:08:30.835Z" },
 ]
 
 [[package]]
@@ -4034,8 +4034,8 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "trackio", marker = "extra == 'trackio'", specifier = "<1.0.0" },
     { name = "transformers" },
-    { name = "verifiers", specifier = ">=0.1.8.post0" },
-    { name = "verifiers", marker = "extra == 'verifiers'", specifier = ">=0.1.8.post0" },
+    { name = "verifiers", specifier = ">=0.1.9.post3" },
+    { name = "verifiers", marker = "extra == 'verifiers'", specifier = ">=0.1.9.post3" },
     { name = "wandb" },
     { name = "wandb", marker = "extra == 'wandb'" },
 ]
@@ -4353,11 +4353,13 @@ wheels = [
 
 [[package]]
 name = "verifiers"
-version = "0.1.8.post2"
+version = "0.1.9.post3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "datasets" },
     { name = "jinja2" },
+    { name = "math-verify" },
+    { name = "mcp" },
     { name = "nest-asyncio" },
     { name = "openai" },
     { name = "openai-agents" },
@@ -4370,9 +4372,9 @@ dependencies = [
     { name = "typing-extensions", marker = "python_full_version < '3.12'" },
     { name = "wget" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/74/89/41112d19ec1a51fc8de3badf3861df712104effb592a1f198ef6d0d04bf5/verifiers-0.1.8.post2.tar.gz", hash = "sha256:d3fb7171117acffc20e2fa9dcfb92c6126bf959d9912bccae264944b61f8696d", size = 119274, upload-time = "2025-12-11T03:20:44.113Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/ea/2251e02d19f6088cade618af15b697d5aa56b55fed5fca21e39891d5c4e2/verifiers-0.1.9.post3.tar.gz", hash = "sha256:138370cbfeb15700e6ee0c81d30f06c0db07c41b9fb4bb40689301769020b684", size = 188973, upload-time = "2026-01-14T19:08:37.12Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d7/41/5e9ad71973cd6b07a96f439bc6f6bac19cc33ce948fddb6a535162fe8984/verifiers-0.1.8.post2-py3-none-any.whl", hash = "sha256:94bef653b152cf7a58ccfed1d553cee0fe119454d017964f6311dd81df36a82a", size = 108061, upload-time = "2025-12-11T03:20:42.689Z" },
+    { url = "https://files.pythonhosted.org/packages/18/4b/ae3ab412f441fd4f274fb035423689f051fff222fe5e91b254617c016c42/verifiers-0.1.9.post3-py3-none-any.whl", hash = "sha256:f1f2f1034003d495d810e8cc8339e51dc77ca7c015bd9bdcc2229d0ea004e464", size = 165553, upload-time = "2026-01-14T19:08:35.234Z" },
 ]
 
 [[package]]

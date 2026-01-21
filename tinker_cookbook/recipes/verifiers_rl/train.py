@@ -29,6 +29,9 @@ from tinker_cookbook.utils.trajectory_progress import (
 logger = logging.getLogger(__name__)
 
 
+class NoTokensError(Exception):
+    pass
+
 def extract_num_tokens_from_state(state: vf.State) -> Dict[str, int]:
     """Extract token counts from the last step in trajectory.
 
@@ -45,23 +48,23 @@ def extract_num_tokens_from_state(state: vf.State) -> Dict[str, int]:
     """
     trajectory = state.get("trajectory", [])
     if not trajectory:
-        raise ValueError("Trajectory is empty, cannot extract token counts")
+        return { "total_tokens": 0, }
     last_step = trajectory[-1]
     response = last_step.get("response")
     if response is None:
-        raise ValueError("Last trajectory step has no response")
+        return { "total_tokens": 0, }
 
     usage = getattr(response, "usage", None)
     if usage is None:
-        raise ValueError("Response has no usage information")
+        return { "total_tokens": 0, }
 
     prompt_tokens = getattr(usage, "prompt_tokens", None)
     if prompt_tokens is None:
-        raise ValueError("Usage has no prompt_tokens")
+        return { "total_tokens": 0, }
 
     completion_tokens = getattr(usage, "completion_tokens", None)
     if completion_tokens is None:
-        raise ValueError("Usage has no completion_tokens")
+        return { "total_tokens": 0, }
 
     return {
         "prompt_tokens": prompt_tokens,
@@ -100,6 +103,11 @@ class CLIConfig:
     async_training: bool = False
     max_steps_off_policy: int = 1
     in_flight_ratio: float = 1.0
+
+    # loss function configuration
+    loss_fn: str = "importance_sampling"  # "importance_sampling" or "ppo"
+    clip_low_threshold: float | None = None  # PPO clip low (e.g. 0.8 means 1 - epsilon_low = 0.8)
+    clip_high_threshold: float | None = None  # PPO clip high (e.g. 1.25 means 1 + epsilon_high = 1.25)
 
     # logging configuration
     eval_every: int = 0
@@ -214,6 +222,14 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         refresh_rate=4.0,
     )
 
+    loss_fn_config: dict[str, float] | None = None
+    if cli_config.clip_low_threshold is not None or cli_config.clip_high_threshold is not None:
+        loss_fn_config = {}
+        if cli_config.clip_low_threshold is not None:
+            loss_fn_config["clip_low_threshold"] = cli_config.clip_low_threshold
+        if cli_config.clip_high_threshold is not None:
+            loss_fn_config["clip_high_threshold"] = cli_config.clip_high_threshold
+
     cfg = train.Config(
         learning_rate=cli_config.learning_rate,
         dataset_builder=dataset_builder,
@@ -228,6 +244,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         log_path=log_path,
         eval_every=cli_config.eval_every,
         save_every=cli_config.save_every,
+        loss_fn=cli_config.loss_fn,
+        loss_fn_config=loss_fn_config,
         async_config=train.AsyncConfig(
             max_steps_off_policy=cli_config.max_steps_off_policy,
             groups_per_batch=cli_config.groups_per_batch,

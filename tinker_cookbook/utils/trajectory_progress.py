@@ -23,6 +23,9 @@ trajectory_group_id: ContextVar[int | None] = ContextVar("traj_group_id", defaul
 trajectory_index: ContextVar[int | None] = ContextVar("traj_index", default=None)
 
 
+# TODO: move this into a parameter of TrajectoryProgressTracker, for now, we will hardcode this so this will work with the run i currently have going
+NUM_TRAINING_GROUPS = 32
+
 class TrajectoryStatus(Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -43,6 +46,8 @@ class TrajectoryState:
     last_touched_time: float | None = None
     num_llm_calls: int = 0
     training_status: str = "pending"  # "pending" | "enqueued" | "done"
+    enqueued_time: float | None = None  # when training_status became "enqueued"
+    fwd_bwd_done_time: float | None = None  # when training_status became "done"
 
     def to_dict(self) -> dict:
         return {
@@ -57,6 +62,8 @@ class TrajectoryState:
             "last_touched_time": self.last_touched_time,
             "num_llm_calls": self.num_llm_calls,
             "training_status": self.training_status,
+            "enqueued_time": self.enqueued_time,
+            "fwd_bwd_done_time": self.fwd_bwd_done_time,
         }
 
 
@@ -248,14 +255,18 @@ class TrajectoryProgressTracker:
         """Called when forward_backward_async is invoked for a trajectory."""
         with self._maybe_create_group(group_id) as group:
             assert trajectory_id in group.trajectories, f"trajectory_id={trajectory_id} not in group_id={group_id}"
-            group.trajectories[trajectory_id].training_status = "enqueued"
+            traj = group.trajectories[trajectory_id]
+            traj.training_status = "enqueued"
+            traj.enqueued_time = time.time()
         self._write_state()
 
     def mark_trajectory_fwd_bwd_done(self, group_id: int, trajectory_id: int) -> None:
         """Called when forward_backward result is consumed for a trajectory."""
         with self._maybe_create_group(group_id) as group:
             assert trajectory_id in group.trajectories, f"trajectory_id={trajectory_id} not in group_id={group_id}"
-            group.trajectories[trajectory_id].training_status = "done"
+            traj = group.trajectories[trajectory_id]
+            traj.training_status = "done"
+            traj.fwd_bwd_done_time = time.time()
         self._write_state()
 
 
@@ -277,6 +288,106 @@ def clear_trajectory_context() -> None:
 # WATCHER - Run in separate terminal: uv run python -m tinker_cookbook.utils.trajectory_progress
 # ============================================================================
 
+
+@dataclass
+class RollingStats:
+    """Track rolling statistics over time for the watcher."""
+
+    window_sec: float = 60.0
+    _history: list[tuple[float, dict]] = field(default_factory=list)
+
+    def update(self, stats: dict) -> None:
+        """Add a new observation."""
+        now = time.time()
+        self._history.append((now, stats))
+        # Prune old entries
+        cutoff = now - self.window_sec
+        self._history = [(t, s) for t, s in self._history if t > cutoff]
+
+    def get_rate(self, key: str) -> float | None:
+        """Compute rate of change for a cumulative metric (e.g., total_tokens)."""
+        if len(self._history) < 2:
+            return None
+        t0, s0 = self._history[0]
+        t1, s1 = self._history[-1]
+        dt = t1 - t0
+        if dt < 1.0:
+            return None
+        v0, v1 = s0.get(key, 0), s1.get(key, 0)
+        return (v1 - v0) / dt
+
+    def get_eta_for_target(self, current_key: str, target_key: str) -> float | None:
+        """Estimate time until current reaches target based on rolling rate."""
+        if len(self._history) < 2:
+            return None
+        latest = self._history[-1][1]
+        current = latest.get(current_key, 0)
+        target = latest.get(target_key, 0)
+        if current >= target:
+            return 0.0
+        rate = self.get_rate(current_key)
+        if rate is None or rate <= 0:
+            return None
+        return (target - current) / rate
+
+    def get_trend(self, key: str) -> str:
+        """Get trend indicator: ↑ ↓ or →"""
+        if len(self._history) < 4:
+            return "→"
+        # Compare first half rate to second half rate
+        mid = len(self._history) // 2
+        first_half = self._history[:mid]
+        second_half = self._history[mid:]
+
+        def half_rate(half: list[tuple[float, dict]]) -> float | None:
+            if len(half) < 2:
+                return None
+            t0, s0 = half[0]
+            t1, s1 = half[-1]
+            dt = t1 - t0
+            if dt < 0.5:
+                return None
+            return (s1.get(key, 0) - s0.get(key, 0)) / dt
+
+        r1, r2 = half_rate(first_half), half_rate(second_half)
+        if r1 is None or r2 is None:
+            return "→"
+        if r2 > r1 * 1.1:
+            return "↑"
+        elif r2 < r1 * 0.9:
+            return "↓"
+        return "→"
+
+
+@dataclass
+class RollingDurationStats:
+    """Track rolling window of duration measurements for latency metrics."""
+
+    window_sec: float = 300.0  # 5 minute window
+    _durations: list[tuple[float, float]] = field(default_factory=list)  # (timestamp, duration)
+    _seen_ids: set[str] = field(default_factory=set)  # track already-seen trajectory IDs
+
+    def add(self, traj_id: str, duration: float) -> None:
+        """Add a duration measurement if not already seen."""
+        if traj_id in self._seen_ids:
+            return
+        self._seen_ids.add(traj_id)
+        now = time.time()
+        self._durations.append((now, duration))
+        cutoff = now - self.window_sec
+        self._durations = [(t, d) for t, d in self._durations if t > cutoff]
+
+    def get_mean(self) -> float | None:
+        """Get mean duration over the window."""
+        if not self._durations:
+            return None
+        return sum(d for _, d in self._durations) / len(self._durations)
+
+    def get_count(self) -> int:
+        """Get number of samples in window."""
+        return len(self._durations)
+
+
 def watch():
     """Watch the progress file and display with rich."""
     from rich.console import Console, Group
@@ -291,6 +402,7 @@ def watch():
         """Compute summary statistics from current state."""
         groups = state.get("groups", {})
         batch_start = state.get("batch_start_time")
+        group_size = state.get("group_size", 8)
         now = time.time()
 
         total_groups = len(groups)
@@ -299,10 +411,16 @@ def watch():
         training_enqueued = 0
         training_done = 0
         total_tokens = 0
+        all_rewards: list[float] = []
 
         # Track completion times for rolling average
         group_completion_times: list[float] = []
         traj_completion_times: list[float] = []
+
+        # New metrics
+        enqueued_groups = 0  # groups with ≥1 enqueued trajectory (not all done)
+        done_groups = 0  # groups where all trajectories have training_status="done"
+        group_reward_variances: list[float] = []
 
         for gid, group in groups.items():
             trajectories = group.get("trajectories", {})
@@ -310,6 +428,11 @@ def watch():
 
             if group.get("end_time"):
                 group_completion_times.append(group["end_time"])
+
+            # Track per-group training status and rewards
+            group_enqueued_count = 0
+            group_done_count = 0
+            group_rewards: list[float] = []
 
             for tid, traj in trajectories.items():
                 tokens = traj.get("tokens_generated", 0)
@@ -319,12 +442,31 @@ def watch():
                     completed_trajectories += 1
                     if traj.get("end_time"):
                         traj_completion_times.append(traj["end_time"])
+                    reward = traj.get("reward")
+                    if reward is not None:
+                        all_rewards.append(reward)
+                        group_rewards.append(reward)
 
                 ts = traj.get("training_status", "pending")
                 if ts == "enqueued":
                     training_enqueued += 1
+                    group_enqueued_count += 1
                 elif ts == "done":
                     training_done += 1
+                    group_done_count += 1
+
+            # Classify groups
+            num_trajs = len(trajectories) if trajectories else group_size
+            if group_done_count == num_trajs and num_trajs > 0:
+                done_groups += 1
+            elif group_enqueued_count > 0:
+                enqueued_groups += 1
+
+            # Compute within-group reward variance
+            if len(group_rewards) >= 2:
+                mean_r = sum(group_rewards) / len(group_rewards)
+                variance = sum((r - mean_r) ** 2 for r in group_rewards) / len(group_rewards)
+                group_reward_variances.append(variance)
 
         completed_groups = len(group_completion_times)
         pending_groups = total_groups - completed_groups
@@ -333,7 +475,7 @@ def watch():
         # Calculate elapsed time
         elapsed = (now - batch_start) if batch_start else 0
 
-        # Overall average rates (since batch start)
+        # Overall average rates (since batch start, per second)
         overall_traj_rate = completed_trajectories / elapsed if elapsed > 0 else 0
         overall_group_rate = completed_groups / elapsed if elapsed > 0 else 0
         overall_token_rate = total_tokens / elapsed if elapsed > 0 else 0
@@ -345,21 +487,27 @@ def watch():
         recent_trajs = sum(1 for t in traj_completion_times if t > cutoff)
         recent_groups = sum(1 for t in group_completion_times if t > cutoff)
 
-        # Calculate actual window duration (min of rolling_window or time since first completion in window)
-        recent_traj_times = [t for t in traj_completion_times if t > cutoff]
-        recent_group_times = [t for t in group_completion_times if t > cutoff]
-
         rolling_traj_rate = recent_trajs / rolling_window if recent_trajs > 0 else overall_traj_rate
         rolling_group_rate = recent_groups / rolling_window if recent_groups > 0 else overall_group_rate
 
         # ETAs
-        # Per-batch ETA: time until all groups finish sampling
         eta_batch_overall = pending_groups / overall_group_rate if overall_group_rate > 0 else float('inf')
         eta_batch_rolling = pending_groups / rolling_group_rate if rolling_group_rate > 0 else float('inf')
-
-        # Per-trajectory ETA: time until all trajectories sampled
         eta_traj_overall = pending_trajectories / overall_traj_rate if overall_traj_rate > 0 else float('inf')
         eta_traj_rolling = pending_trajectories / rolling_traj_rate if rolling_traj_rate > 0 else float('inf')
+
+        # Reward stats
+        mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else None
+        min_reward = min(all_rewards) if all_rewards else None
+        max_reward = max(all_rewards) if all_rewards else None
+        positive_count = sum(1 for r in all_rewards if r > 0)
+        positive_pct = (positive_count / len(all_rewards) * 100) if all_rewards else None
+
+        # Within-group reward variance (mean across groups)
+        mean_within_group_variance = (
+            sum(group_reward_variances) / len(group_reward_variances)
+            if group_reward_variances else None
+        )
 
         return {
             "elapsed": elapsed,
@@ -380,6 +528,13 @@ def watch():
             "eta_traj_overall": eta_traj_overall,
             "eta_traj_rolling": eta_traj_rolling,
             "num_workers": state.get("num_workers"),
+            "mean_reward": mean_reward,
+            "min_reward": min_reward,
+            "max_reward": max_reward,
+            "positive_pct": positive_pct,
+            "enqueued_groups": enqueued_groups,
+            "done_groups": done_groups,
+            "mean_within_group_variance": mean_within_group_variance,
         }
 
     def format_time(seconds: float) -> str:
@@ -390,7 +545,13 @@ def watch():
             return f"{int(seconds // 3600)}:{int((seconds % 3600) // 60):02d}:{int(seconds % 60):02d}"
         return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
-    def build_dashboard(stats: dict) -> Panel:
+    def build_dashboard(
+        stats: dict,
+        rolling: RollingStats,
+        rolling_enq_to_done: RollingDurationStats,
+        rolling_pend_to_sampled: RollingDurationStats,
+        rolling_e2e: RollingDurationStats,
+    ) -> Panel:
         """Build the summary dashboard panel."""
         text = Text()
 
@@ -406,22 +567,83 @@ def watch():
         text.append(f"Training R:{stats['training_enqueued']} D:{stats['training_done']}", style="yellow")
         text.append("\n")
 
-        # Row 2: Throughput
+        # Row 2: Throughput with trends (converted to /min)
         text.append("Throughput: ", style="bold")
-        text.append(f"{stats['rolling_traj_rate']:.2f} traj/s", style="magenta")
+        traj_trend = rolling.get_trend("completed_trajectories")
+        tok_trend = rolling.get_trend("total_tokens")
+        text.append(f"{stats['rolling_traj_rate'] * 60:.1f} traj/min {traj_trend}", style="magenta")
         text.append(" │ ", style="dim")
-        text.append(f"{stats['rolling_group_rate']:.2f} grp/s", style="magenta")
+        text.append(f"{stats['rolling_group_rate'] * 60:.1f} grp/min", style="magenta")
         text.append(" │ ", style="dim")
-        text.append(f"{stats['overall_token_rate'] / 1000:.1f}k tok/s", style="magenta")
+        rolling_tok_rate = rolling.get_rate("total_tokens")
+        if rolling_tok_rate is not None:
+            text.append(f"{rolling_tok_rate / 1000:.1f}k tok/s {tok_trend}", style="magenta")
+        else:
+            text.append(f"{stats['overall_token_rate'] / 1000:.1f}k tok/s", style="magenta")
         text.append("\n")
 
-        # Row 3: ETAs
-        text.append("ETA (rolling/overall): ", style="bold")
-        text.append(f"Batch {format_time(stats['eta_batch_rolling'])}/{format_time(stats['eta_batch_overall'])}", style="blue")
+        # Row 3: Latencies (rolling windows)
+        text.append("Latencies: ", style="bold")
+        enq_to_done_mean = rolling_enq_to_done.get_mean()
+        pend_to_sampled_mean = rolling_pend_to_sampled.get_mean()
+        e2e_mean = rolling_e2e.get_mean()
+        if enq_to_done_mean is not None:
+            text.append(f"Enq→Done μ={enq_to_done_mean:.1f}s", style="cyan")
+        else:
+            text.append("Enq→Done --", style="dim")
         text.append(" │ ", style="dim")
-        text.append(f"Trajs {format_time(stats['eta_traj_rolling'])}/{format_time(stats['eta_traj_overall'])}", style="blue")
+        if pend_to_sampled_mean is not None:
+            text.append(f"Pend→Sampled μ={pend_to_sampled_mean:.1f}s", style="cyan")
+        else:
+            text.append("Pend→Sampled --", style="dim")
+        text.append(" │ ", style="dim")
+        if e2e_mean is not None:
+            text.append(f"E2E μ={e2e_mean:.1f}s (*)", style="bright_cyan bold")
+        else:
+            text.append("E2E --", style="dim")
+        text.append("\n")
+
+        # Row 4: State counts and variance
+        text.append("State: ", style="bold")
+        text.append(f"{stats['enqueued_groups']} enqueued grps", style="yellow")
+        text.append(" │ ", style="dim")
+        text.append(f"{stats['done_groups']} done grps", style="green")
+        text.append(" │ ", style="dim")
+        if stats['mean_within_group_variance'] is not None:
+            text.append(f"Grp Var={stats['mean_within_group_variance']:.2f}", style="cyan")
+        else:
+            text.append("Grp Var=--", style="dim")
+        text.append("\n")
+
+        # Row 5: ETAs (rolling-based) + Step ETA using E2E
+        text.append("ETA: ", style="bold")
+        rolling_traj_eta = rolling.get_eta_for_target("completed_trajectories", "total_trajectories")
+        if rolling_traj_eta is not None:
+            text.append(f"Trajs {format_time(rolling_traj_eta)}", style="blue")
+        else:
+            text.append(f"Trajs {format_time(stats['eta_traj_rolling'])}", style="blue")
+        text.append(" │ ", style="dim")
+        # Step ETA: remaining trajs in current step × E2E mean
+        remaining_trajs = stats['total_trajectories'] - stats['training_done']
+        if e2e_mean is not None and remaining_trajs > 0:
+            step_eta = remaining_trajs * e2e_mean
+            text.append(f"Step {format_time(step_eta)}", style="blue")
+        else:
+            text.append("Step --:--", style="dim")
         text.append(" │ ", style="dim")
         text.append(f"Elapsed {format_time(stats['elapsed'])}", style="dim")
+        text.append("\n")
+
+        # Row 6: Reward stats
+        text.append("Rewards: ", style="bold")
+        if stats['mean_reward'] is not None:
+            text.append(f"μ={stats['mean_reward']:+.2f}", style="green")
+            text.append(" │ ", style="dim")
+            text.append(f"min={stats['min_reward']:+.2f} max={stats['max_reward']:+.2f}", style="cyan")
+            text.append(" │ ", style="dim")
+            text.append(f"{stats['positive_pct']:.0f}% positive", style="yellow")
+        else:
+            text.append("--", style="dim")
 
         return Panel(text, title="Dashboard", border_style="bright_black", padding=(0, 1))
 
@@ -454,6 +676,8 @@ def watch():
         table.add_column("Done", width=5, justify="right")
         table.add_column("μRwd", width=5, justify="right")
         table.add_column("Time", width=5, justify="right")
+        table.add_column("Min", width=3, justify="right")
+        table.add_column("Max", width=3, justify="right")
 
         # First pass: compute mean rewards for all groups
         group_mean_rewards: dict[str, float | None] = {}
@@ -503,6 +727,12 @@ def watch():
             top3_threshold = group_data[gid]["top3_threshold"]
             mean_reward = group_mean_rewards[gid]
 
+            # Check if any trajectory is enqueued
+            has_enqueued = any(
+                trajectories.get(str(t), trajectories.get(t, {})).get("training_status") == "enqueued"
+                for t in range(group_size)
+            )
+
             row: list[str | Text] = [f"G{int(gid):02d}"]
             completed = 0
 
@@ -531,16 +761,17 @@ def watch():
                 elif status == "sampled":
                     completed += 1  # count as completed for Done column
                     ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
-                    rwd_text = Text("   ?", style="bright_magenta bold")
+                    rwd_text = Text("   ·", style="dim")
                 elif status == "in_progress":
                     ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
-                    rwd_text = Text("   ?", style="bright_cyan bold")
+                    rwd_text = Text("   ·", style="dim")
                 else:
                     ctx_text = Text("  ·", style="dim")
                     rwd_text = Text("   ·", style="dim")
 
                 # Time since last activity (age in seconds)
-                if training_status == "done":
+                # Hide individual ages when enqueued (all same, shown in Min/Max instead)
+                if has_enqueued or training_status == "done" or status == "sampled":
                     age_text = Text("  ·", style="dim")
                 elif end_time:
                     age = int(now - end_time)
@@ -559,7 +790,7 @@ def watch():
                 elif status == "sampled":
                     st_text = Text("W", style="bright_magenta bold")
                 else:
-                    st_text = Text("·", style="dim")
+                    st_text = Text("S", style="green")
 
                 row.extend([ctx_text, rwd_text, age_text, st_text])
                 if tid < group_size - 1:
@@ -584,14 +815,68 @@ def watch():
                 row.append(Text("--", style="dim"))
             row.append(time_str)
 
+            # Min/Max age across all trajectories (including W/sampled)
+            ages = []
+            for t in range(group_size):
+                traj = trajectories.get(str(t), trajectories.get(t, {}))
+                traj_end = traj.get("end_time")
+                traj_last = traj.get("last_touched_time")
+                ref_time = traj_end or traj_last
+                if ref_time:
+                    ages.append(int(now - ref_time))
+
+            if ages:
+                row.append(Text(f"{min(ages):3d}", style="white"))
+                row.append(Text(f"{max(ages):3d}", style="white"))
+            else:
+                row.append(Text("  ·", style="dim"))
+                row.append(Text("  ·", style="dim"))
+
             table.add_row(*row)
 
         return table
 
-    def build_display(state: dict) -> Group:
+    def feed_rolling_durations(
+        state: dict,
+        rolling_enq_to_done: RollingDurationStats,
+        rolling_pend_to_sampled: RollingDurationStats,
+        rolling_e2e: RollingDurationStats,
+    ) -> None:
+        """Feed rolling duration trackers from current state."""
+        groups = state.get("groups", {})
+        for gid, group in groups.items():
+            trajectories = group.get("trajectories", {})
+            for tid, traj in trajectories.items():
+                traj_id = f"{gid}_{tid}"
+
+                # Enqueued → Done (training latency)
+                enq_time = traj.get("enqueued_time")
+                done_time = traj.get("fwd_bwd_done_time")
+                if enq_time is not None and done_time is not None:
+                    rolling_enq_to_done.add(traj_id, done_time - enq_time)
+
+                # Pending → Sampled (sampling latency)
+                start_time = traj.get("start_time")
+                end_time = traj.get("end_time")
+                if start_time is not None and end_time is not None:
+                    rolling_pend_to_sampled.add(traj_id, end_time - start_time)
+
+                # End-to-end: start_time → fwd_bwd_done_time
+                if start_time is not None and done_time is not None:
+                    rolling_e2e.add(traj_id, done_time - start_time)
+
+    def build_display(
+        state: dict,
+        rolling: RollingStats,
+        rolling_enq_to_done: RollingDurationStats,
+        rolling_pend_to_sampled: RollingDurationStats,
+        rolling_e2e: RollingDurationStats,
+    ) -> Group:
         """Build complete display with dashboard and table."""
         stats = compute_stats(state)
-        dashboard = build_dashboard(stats)
+        rolling.update(stats)
+        feed_rolling_durations(state, rolling_enq_to_done, rolling_pend_to_sampled, rolling_e2e)
+        dashboard = build_dashboard(stats, rolling, rolling_enq_to_done, rolling_pend_to_sampled, rolling_e2e)
         table = build_table(state)
         return Group(dashboard, table)
 
@@ -600,6 +885,10 @@ def watch():
 
     last_mtime = 0.0
     state = {}
+    rolling = RollingStats(window_sec=60.0)
+    rolling_enq_to_done = RollingDurationStats(window_sec=300.0)
+    rolling_pend_to_sampled = RollingDurationStats(window_sec=300.0)
+    rolling_e2e = RollingDurationStats(window_sec=300.0)
 
     with Live(Table(), console=console, refresh_per_second=4) as live:
         while True:
@@ -609,7 +898,9 @@ def watch():
                     if mtime != last_mtime:
                         last_mtime = mtime
                         state = json.loads(PROGRESS_FILE.read_text())
-                    live.update(build_display(state))
+                    live.update(build_display(
+                        state, rolling, rolling_enq_to_done, rolling_pend_to_sampled, rolling_e2e
+                    ))
                 time.sleep(0.1)
             except KeyboardInterrupt:
                 break

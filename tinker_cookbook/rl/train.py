@@ -155,6 +155,7 @@ async def train_step(
     learning_rate: float,
     num_substeps: int,
     loss_fn: LossFnType,
+    loss_fn_config: dict[str, float] | None,  # TODO: must fix this slop - should be typed config
 ) -> List[torch.Tensor]:
     """Train the model on collected trajectories.
 
@@ -169,7 +170,7 @@ async def train_step(
 
     # Enqueue first batch
     fwd_bwd_future = await training_client.forward_backward_async(
-        [_remove_mask(d) for d in batches[0]], loss_fn=loss_fn
+        [_remove_mask(d) for d in batches[0]], loss_fn=loss_fn, loss_fn_config=loss_fn_config
     )
     optim_future = await training_client.optim_step_async(adam_params)
 
@@ -177,7 +178,7 @@ async def train_step(
         # Enqueue next batch before consuming current results (to stay on same clock cycle)
         if i + 1 < len(batches):
             next_fwd_bwd_future = await training_client.forward_backward_async(
-                [_remove_mask(d) for d in batches[i + 1]], loss_fn=loss_fn
+                [_remove_mask(d) for d in batches[i + 1]], loss_fn=loss_fn, loss_fn_config=loss_fn_config
             )
             next_optim_future = await training_client.optim_step_async(adam_params)
         else:
@@ -244,6 +245,8 @@ class Config:
 
     # Loss function to use for training: "importance_sampling" or "ppo"
     loss_fn: LossFnType = "importance_sampling"
+    # TODO: must fix this slop - dict[str, float] | None should be a typed config, None default is bad
+    loss_fn_config: dict[str, float] | None = None  # e.g. {"clip_low_threshold": 0.9, "clip_high_threshold": 1.1}
 
     # Number of optimizer steps per training iteration.
     # Useful for very large batch sizes.
@@ -897,7 +900,7 @@ async def do_train_step_streaming_and_get_sampling_client(
                             tracker.mark_trajectory_training_enqueued(gid, tid)
 
                 future = await training_client.forward_backward_async(
-                    [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
+                    [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn, loss_fn_config=cfg.loss_fn_config
                 )
                 await fwd_bwd_queue.put((future, trajectories, data_D))
                 all_wrapped_trajectory_groups.extend(minibatch_wgs)
@@ -992,6 +995,7 @@ async def do_train_step_and_get_sampling_client(
             cfg.learning_rate,
             cfg.num_substeps,
             cfg.loss_fn,
+            cfg.loss_fn_config,
         )
 
     sampling_client, full_batch_metrics = await compute_full_batch_metrics_and_get_sampling_client(

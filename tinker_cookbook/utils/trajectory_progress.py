@@ -388,7 +388,7 @@ class RollingDurationStats:
         return len(self._durations)
 
 
-def watch():
+def watch(capture_file: str | None):
     """Watch the progress file and display with rich."""
     from rich.console import Console, Group
     from rich.live import Live
@@ -789,6 +789,8 @@ def watch():
                     st_text = Text("R", style="red bold")
                 elif status == "sampled":
                     st_text = Text("W", style="bright_magenta bold")
+                elif status == "completed":
+                    st_text = Text("C", style="yellow bold")
                 else:
                     st_text = Text("S", style="green")
 
@@ -890,6 +892,23 @@ def watch():
     rolling_pend_to_sampled = RollingDurationStats(window_sec=300.0)
     rolling_e2e = RollingDurationStats(window_sec=300.0)
 
+    if capture_file is not None:
+        if not PROGRESS_FILE.exists():
+            raise FileNotFoundError(f"Progress file not found: {PROGRESS_FILE}")
+        state = json.loads(PROGRESS_FILE.read_text())
+        display = build_display(
+            state, rolling, rolling_enq_to_done, rolling_pend_to_sampled, rolling_e2e
+        )
+        file_console = Console(
+            file=open(capture_file, "w"),
+            width=console.width,
+            no_color=True,
+            highlight=False,
+        )
+        file_console.print(display)
+        file_console.file.close()
+        return
+
     with Live(Table(), console=console, refresh_per_second=4) as live:
         while True:
             try:
@@ -909,4 +928,8 @@ def watch():
 
 
 if __name__ == "__main__":
-    watch()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--capture", type=str, help="Write rendered table to this file on each update")
+    args = parser.parse_args()
+    watch(capture_file=args.capture)

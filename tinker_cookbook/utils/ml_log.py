@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.table import Table
 from tinker_cookbook.utils.code_state import code_state
 
-logger = logging.getLogger(__name__)
+from observability import log, bootstrap, set_run_id, Events
 
 # Check WandB availability
 _wandb_available = False
@@ -140,7 +140,7 @@ class JsonLogger(Logger):
 
         with open(self.metrics_file, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
-            logger.info("Wrote metrics to %s", self.metrics_file)
+            log.info("wrote metrics", metrics_file=str(self.metrics_file))
 
 
 class PrettyPrintLogger(Logger):
@@ -192,7 +192,7 @@ def _maybe_truncate_repr(value: Any) -> str:
 def _rich_console_use_logger(console: Console):
     with console.capture() as capture:
         yield
-    logger.info("\n" + capture.get().rstrip())
+    log.info("console output", output="\n" + capture.get().rstrip())
     # ^^^ add a leading newline so things like table formatting work properly
 
 
@@ -233,7 +233,7 @@ class WandbLogger(Logger):
         """Log metrics to wandb."""
         if self.run and wandb is not None:
             wandb.log(metrics, step=step, commit=True)
-            logger.info("Logging to: %s", self.run.url)
+            log.info("logged metrics", component="wandb", wandb_url=self.run.url)
 
     def close(self) -> None:
         """Close wandb run."""
@@ -289,7 +289,7 @@ class NeptuneLogger(Logger):
         if self.run and NeptuneRun is not None:
             assert step is not None, "step is required to be int or float for Neptune logging."
             self.run.log_metrics(metrics, step=step)
-            logger.info("Logging to: %s", self.run.get_run_url())
+            log.info("logged metrics", component="neptune", neptune_url=self.run.get_run_url())
 
     def close(self) -> None:
         """Close neptune run."""
@@ -329,7 +329,7 @@ class TrackioLogger(Logger):
         """Log metrics to trackio."""
         if self.run and trackio is not None:
             trackio.log(metrics, step=step)
-            logger.info("Logged metrics to Trackio project: %s", self.run.project)
+            log.info("logged metrics", component="trackio", trackio_project=self.run.project)
 
     def close(self) -> None:
         """Close trackio run."""
@@ -345,36 +345,36 @@ class MultiplexLogger(Logger):
 
     def log_hparams(self, config: Any) -> None:
         """Forward log_hparams to all child loggers."""
-        for logger in self.loggers:
-            logger.log_hparams(config)
+        for child_logger in self.loggers:
+            child_logger.log_hparams(config)
 
     def log_metrics(self, metrics: Dict[str, Any], step: int | None = None) -> None:
         """Forward log_metrics to all child loggers."""
-        for logger in self.loggers:
-            logger.log_metrics(metrics, step)
+        for child_logger in self.loggers:
+            child_logger.log_metrics(metrics, step)
 
     def log_long_text(self, key: str, text: str) -> None:
         """Forward log_long_text to all child loggers."""
-        for logger in self.loggers:
-            if hasattr(logger, "log_long_text"):
-                logger.log_long_text(key, text)
+        for child_logger in self.loggers:
+            if hasattr(child_logger, "log_long_text"):
+                child_logger.log_long_text(key, text)
 
     def close(self) -> None:
         """Close all child loggers."""
-        for logger in self.loggers:
-            if hasattr(logger, "close"):
-                logger.close()
+        for child_logger in self.loggers:
+            if hasattr(child_logger, "close"):
+                child_logger.close()
 
     def sync(self) -> None:
         """Sync all child loggers."""
-        for logger in self.loggers:
-            if hasattr(logger, "sync"):
-                logger.sync()
+        for child_logger in self.loggers:
+            if hasattr(child_logger, "sync"):
+                child_logger.sync()
 
     def get_logger_url(self) -> str | None:
         """Get the first URL returned by the child loggers."""
-        for logger in self.loggers:
-            if url := logger.get_logger_url():
+        for child_logger in self.loggers:
+            if url := child_logger.get_logger_url():
                 return url
         return None
 
@@ -415,9 +415,9 @@ def setup_logging(
     # Add W&B logger if available and configured
     if wandb_project:
         if not _wandb_available:
-            print("WARNING: wandb is not installed. Skipping W&B logging.")
+            log.warning("wandb is not installed, skipping W&B logging")
         elif not os.environ.get("WANDB_API_KEY"):
-            print("WARNING: WANDB_API_KEY environment variable not set. Skipping W&B logging. ")
+            log.warning("WANDB_API_KEY environment variable not set, skipping W&B logging")
         else:
             loggers.append(
                 WandbLogger(
@@ -435,12 +435,9 @@ def setup_logging(
     # - Also allow logging to both W&B and Neptune
     if wandb_project and _neptune_available:
         # if not _neptune_available:
-        #     print("WARNING: neptune-scale is not installed. Skipping Neptune logging.")
+        #     log.warning("neptune-scale is not installed, skipping Neptune logging")
         if not os.environ.get("NEPTUNE_API_TOKEN"):
-            print(
-                "WARNING: NEPTUNE_API_TOKEN environment variable not set. "
-                "Skipping Neptune logging. "
-            )
+            log.warning("NEPTUNE_API_TOKEN environment variable not set, skipping Neptune logging")
         else:
             loggers.append(
                 NeptuneLogger(
@@ -460,7 +457,7 @@ def setup_logging(
                 trackio_name=wandb_name,
             )
         )
-        print(f"Trackio logging enabled for project: {wandb_project}")
+        log.info("trackio logging enabled", project=wandb_project)
 
     # Create multiplex logger
     ml_logger = MultiplexLogger(loggers)
@@ -472,7 +469,7 @@ def setup_logging(
     if do_configure_logging_module:
         configure_logging_module(str(log_dir_path / "logs.log"))
 
-    logger.info(f"Logging to: {log_dir_path}")
+    log.info("logging initialized", log_dir=str(log_dir_path))
     return ml_logger
 
 

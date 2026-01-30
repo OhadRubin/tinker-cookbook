@@ -11,9 +11,10 @@ Returns OpenAI types (ChatCompletion / Completion) constructed from sampled toke
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from typing import Any, Dict, List, Literal, overload
+
+from observability import log, bootstrap, set_run_id, Events
 
 import tinker
 import verifiers as vf
@@ -30,8 +31,6 @@ from tinker import BadRequestError
 TIMEOUT_ERROR_PREFIX = "TINKER_TIMEOUT: "
 SAMPLING_TIMEOUT_SECONDS = 180
 SAMPLING_TIMEOUT_INCREMENT = 30
-
-logger = logging.getLogger(__name__)
 
 from tinker_cookbook.utils.trajectory_progress import (
     TrajectoryProgressTracker,
@@ -78,12 +77,12 @@ async def sample_with_retries(
                 )
                 return sample
             except asyncio.TimeoutError:
-                logger.warning(f"Client-side timeout ({timeout}s) on attempt {attempt_number}, retrying...")
+                log.warning("client-side timeout, retrying", component="client", timeout_seconds=timeout, attempt_number=attempt_number)
                 raise SamplingTimeoutError()
             except BadRequestError as e:
                 # if TIMEOUT_ERROR_PREFIX not in e.message:
                 #     raise
-                logger.warning(f"Server-side timeout on attempt {attempt_number}, retrying...")
+                log.warning("server-side timeout, retrying", component="server", attempt_number=attempt_number)
                 raise SamplingTimeoutError()
 
 

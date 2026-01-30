@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Dict, cast
+
+import verifiers as vf
+
+from observability import log, bootstrap, set_run_id, Events
 
 import chz
 from verifiers.utils.async_utils import maybe_semaphore
@@ -25,8 +28,6 @@ from tinker_cookbook.utils.trajectory_progress import (
     set_trajectory_context,
     clear_trajectory_context,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class NoTokensError(Exception):
@@ -262,5 +263,6 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
 
 
 if __name__ == "__main__":
+    bootstrap("verifiers-rl-train")
     cli_config = chz.entrypoint(CLIConfig)
     asyncio.run(cli_main(cli_config, None))

@@ -10,6 +10,8 @@ import numpy as np
 import verifiers as vf
 from verifiers.utils.message_utils import messages_to_printable
 
+from observability import log, bootstrap, set_run_id, Events
+
 from tinker_cookbook import model_info, renderers
 from tinker_cookbook.recipes.verifiers_rl.tinker_openai import TinkerAsyncOpenAIClient
 from tinker_cookbook.tokenizer_utils import get_tokenizer
@@ -23,38 +25,38 @@ def log_results(
     rollouts_per_example: int,
     time_s: float,
 ):
-    print(f"Evaluation completed in {time_s:.2f} seconds")
-    print("--- Evaluation ---")
-    print(f"Environment: {vf_env_id}")
-    print(f"Model: {model_name}")
-    print(f"Examples: {num_examples}")
-    print(f"Rollouts per example: {rollouts_per_example}")
-    print("--- Example ---")
+    log.info("evaluation completed", time_s=round(time_s, 2))
+    log.info(
+        "evaluation config",
+        environment=vf_env_id,
+        model=model_name,
+        num_examples=num_examples,
+        rollouts_per_example=rollouts_per_example,
+    )
+    log.info("example section")
     printable_prompts = [messages_to_printable(p) for p in results["prompt"]]
     printable_completions = [messages_to_printable(c) for c in results["completion"]]
     vf.print_prompt_completions_sample(
         printable_prompts, printable_completions, results["reward"], step=0
     )
-    print("--- All ---")
-    print("Rewards:")
-    print(
-        f"reward: avg - {sum(results['reward']) / len(results['reward']):.3f}, std - {np.std(results['reward']):.3f}"
-    )
+    reward_avg = sum(results["reward"]) / len(results["reward"])
+    reward_std = np.std(results["reward"])
+    log.info("reward summary", avg=round(reward_avg, 3), std=round(float(reward_std), 3))
     r = rollouts_per_example
     n = len(results["reward"]) // r
     for i in range(r):
         # rounded to 3 decimal places
         trials = [round(results["reward"][(i * n) + j], 3) for j in range(n)]
-        out = f"r{i + 1}: {trials}"
-        print(out)
+        log.info("reward rollout", rollout_index=i + 1, trials=trials)
     for k in results["metrics"]:
         v = results["metrics"][k]
-        print(f"{k}: avg - {sum(v) / len(v):.3f}, std - {np.std(v):.3f}")
+        metric_avg = sum(v) / len(v)
+        metric_std = np.std(v)
+        log.info("metric summary", metric=k, avg=round(metric_avg, 3), std=round(float(metric_std), 3))
         for i in range(r):
             # rounded to 3 decimal places
             trials = [round(v[(i * n) + j], 3) for j in range(n)]
-            out = f"r{i + 1}: {trials}"
-            print(out)
+            log.info("metric rollout", metric=k, rollout_index=i + 1, trials=trials)
 
 
 async def evaluate(
@@ -153,6 +155,7 @@ async def cli_main(cfg: CLIConfig):
 
 
 if __name__ == "__main__":
+    bootstrap("verifiers-rl-evaluate")
     cfg = chz.entrypoint(CLIConfig)
 
     asyncio.run(cli_main(cfg))

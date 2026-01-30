@@ -7,6 +7,8 @@ Run `uv run python -m tinker_cookbook.utils.trajectory_progress` in another term
 
 from __future__ import annotations
 
+from observability import log, bootstrap, set_run_id, Events
+
 import json
 import threading
 import time

@@ -4,7 +4,7 @@ Progress tracking for RL trajectory collection.
 Writes state to a JSON file that can be watched by a separate display process.
  export 
 Run `(cd ~/tinker-cookbook && PYTHONPATH="/root/tinker-self-hosting:$PYTHONPATH" uv run python -m tinker_cookbook.utils.trajectory_progress)` in another terminal to watch.
- cd ~/tinker-cookbook && PYTHONPATH="/root/tinker-self-hosting:$PYTHONPATH" uv run python -m tinker_cookbook.utils.trajectory_progress
+ cd ~/tinker-cookbook && PYTHONPATH="$HOME/tinker-self-hosting:$PYTHONPATH" uv run python -m tinker_cookbook.utils.trajectory_progress
 """
 
 

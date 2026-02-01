@@ -77,12 +77,12 @@ async def sample_with_retries(
                 )
                 return sample
             except asyncio.TimeoutError:
-                log.warning("client-side timeout, retrying", component="client", timeout_seconds=timeout, attempt_number=attempt_number)
+                log.error("client-side timeout, retrying", component="client", timeout_seconds=timeout, attempt_number=attempt_number)
                 raise SamplingTimeoutError()
             except BadRequestError as e:
                 # if TIMEOUT_ERROR_PREFIX not in e.message:
                 #     raise
-                log.warning("server-side timeout, retrying", component="server", attempt_number=attempt_number)
+                log.error("server-side timeout, retrying", component="server", attempt_number=attempt_number)
                 raise SamplingTimeoutError()
 
 
@@ -162,6 +162,14 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             effective_max_tokens = int(max_tokens or 128)
             total_tokens = len(prompt_token_ids) + effective_max_tokens
             if total_tokens > self._parent.max_context_length:
+                log.error(
+                    "Request exceeds max context length",
+                    component="client",
+                    prompt_tokens=len(prompt_token_ids),
+                    max_tokens=effective_max_tokens,
+                    total_tokens=total_tokens,
+                    max_context_length=self._parent.max_context_length,
+                )
                 raise vf.OverlongPromptError(
                     f"Request exceeds max context length: "
                     f"{len(prompt_token_ids)} prompt tokens + {effective_max_tokens} max_tokens = "

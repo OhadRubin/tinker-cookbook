@@ -132,7 +132,7 @@ def print_group(traj_group: TrajectoryGroup, tokenizer: Tokenizer):
         bprint(colorize_example(datum, tokenizer, key="advantages"))
         last_metadata = metadata
     bprint("====== End Trajectory Group ======")
-    log.info("trajectory_group_printed", content=buf.getvalue().rstrip())
+    log.debug("trajectory_group_printed", component="rl_train", content=buf.getvalue().rstrip())
 
 
 def _remove_mask(datum: tinker.Datum) -> tinker.Datum:
@@ -490,43 +490,43 @@ async def do_async_training(
     @scope
     def shutdown_loops():
         """Trigger all loops to shutdown"""
-        log.info("triggering shutdown", component="shutdown_loops", num_workers=num_workers)
+        log.debug("triggering shutdown", component="shutdown_loops", num_workers=num_workers)
         shutdown_event.set()
         for _ in range(num_workers):
             env_group_builders_queue.put_nowait(None)
         sampling_client_updated_event.set()
-        log.info("shutdown signals sent", component="shutdown_loops")
+        log.debug("shutdown signals sent", component="shutdown_loops")
 
     @scope
     async def dataloader_loop():
         """Gets the next set of env builders to run"""
-        log.info("starting", component="dataloader", start_batch=start_batch, end_batch=end_batch)
+        log.debug("starting", component="dataloader", start_batch=start_batch, end_batch=end_batch)
         i_batch = start_batch
         total_builders_added = 0
         while not shutdown_event.is_set() and i_batch < end_batch:
             env_group_builders_P = dataset.get_batch(i_batch)
-            log.info("got builders from dataset", component="dataloader", batch=i_batch, num_builders=len(env_group_builders_P), qsize=env_group_builders_queue.qsize())
+            log.debug("got builders from dataset", component="dataloader", batch=i_batch, num_builders=len(env_group_builders_P), qsize=env_group_builders_queue.qsize())
             for env_group_builder in env_group_builders_P:
                 gid = tracker.allocate_group_id()
                 env_group_builder._progress_group_id = gid
                 await env_group_builders_queue.put(env_group_builder)
                 total_builders_added += 1
                 log.debug("added builder to queue", component="dataloader", batch=i_batch, gid=gid, qsize=env_group_builders_queue.qsize())
-            log.info("done adding builders", component="dataloader", batch=i_batch, total_builders_added=total_builders_added)
+            log.debug("done adding builders", component="dataloader", batch=i_batch, total_builders_added=total_builders_added)
             i_batch += 1
-        log.info("finished", component="dataloader", total_builders_added=total_builders_added, num_batches=i_batch - start_batch)
+        log.debug("finished", component="dataloader", total_builders_added=total_builders_added, num_batches=i_batch - start_batch)
 
     @scope
     async def trajectory_group_worker_loop():
         """Generates trajectories for a single env builder"""
         worker_id = id(asyncio.current_task())
-        log.info("worker started", component="worker", worker_id=worker_id)
+        log.debug("worker started", component="worker", worker_id=worker_id)
         rollout_count = 0
         while not shutdown_event.is_set():
             log.debug("waiting for builder from env_group_builders_queue", component="worker", worker_id=worker_id, qsize=env_group_builders_queue.qsize())
             env_group_builder = await env_group_builders_queue.get()
             if env_group_builder is None:
-                log.info("received none, shutting down", component="worker", worker_id=worker_id, rollout_count=rollout_count)
+                log.debug("received none, shutting down", component="worker", worker_id=worker_id, rollout_count=rollout_count)
                 break
 
             # Allocate new group ID for requeued builders (stale ones have ID deleted)
@@ -534,14 +534,14 @@ async def do_async_training(
             if is_requeued:
                 env_group_builder._progress_group_id = tracker.allocate_group_id()
             gid = env_group_builder._progress_group_id
-            log.info("got builder", component="worker", worker_id=worker_id, gid=gid, requeued=is_requeued, sampling_client_step=sampling_client_step)
+            log.debug("got builder", component="worker", worker_id=worker_id, gid=gid, requeued=is_requeued, sampling_client_step=sampling_client_step)
 
             metrics = {}
             t_start = time.time()
             # Save a reference to the sampling client step in case it changes
             # while we're running the rollout
             sampling_client_step_copy = sampling_client_step
-            log.info("starting rollout", component="worker", worker_id=worker_id, gid=gid, sampling_client_step_copy=sampling_client_step_copy)
+            log.debug("starting rollout", component="worker", worker_id=worker_id, gid=gid, sampling_client_step_copy=sampling_client_step_copy)
             try:
                 trajectory_group = await do_group_rollout_and_filter_constant_reward(
                     sampling_client,
@@ -565,10 +565,10 @@ async def do_async_training(
             rollout_duration = time.time() - t_start
             rollout_count += 1
             if trajectory_group is None:
-                log.info("rollout returned none (constant reward filtered)", component="worker", worker_id=worker_id, gid=gid, duration_s=rollout_duration)
+                log.debug("rollout returned none (constant reward filtered)", component="worker", worker_id=worker_id, gid=gid, duration_s=rollout_duration)
                 trajectory_groups_queue.put_nowait(None)
             else:
-                log.info("rollout completed", component="worker", worker_id=worker_id, gid=gid, duration_s=rollout_duration, qsize=trajectory_groups_queue.qsize())
+                log.debug("rollout completed", component="worker", worker_id=worker_id, gid=gid, duration_s=rollout_duration, qsize=trajectory_groups_queue.qsize())
                 metrics["time/trajectory_group_worker_loop/total"] = rollout_duration
                 trajectory_groups_queue.put_nowait(
                     WrappedTrajectoryGroup(
@@ -587,7 +587,7 @@ async def do_async_training(
         Will discard trajectories that are too stale.
         """
         assert cfg.async_config is not None
-        log.info("started", component="training_loop", start_batch=start_batch, end_batch=end_batch, max_steps_off_policy=cfg.async_config.max_steps_off_policy)
+        log.debug("started", component="training_loop", start_batch=start_batch, end_batch=end_batch, max_steps_off_policy=cfg.async_config.max_steps_off_policy)
 
         i_batch = start_batch
         wrapped_trajectory_groups = []
@@ -621,7 +621,7 @@ async def do_async_training(
                 assert cfg.async_config is not None
                 if staleness > cfg.async_config.max_steps_off_policy:
                     stale_count_this_step += 1
-                    log.info("stale", component="filter_stale", step=i_batch, gid=gid, staleness=staleness, max_off_policy=cfg.async_config.max_steps_off_policy, stale_count=stale_count_this_step, valid_count=valid_count_this_step)
+                    log.debug("stale", component="filter_stale", step=i_batch, gid=gid, staleness=staleness, max_off_policy=cfg.async_config.max_steps_off_policy, stale_count=stale_count_this_step, valid_count=valid_count_this_step)
                     # Remove stale group from tracker and clear ID so it gets reallocated
                     if hasattr(wrapped_trajectory_group.env_group_builder, "_progress_group_id"):
                         tracker.remove_group(gid)
@@ -634,7 +634,7 @@ async def do_async_training(
                     log.debug("requeued builder to env_group_builders_queue", component="filter_stale", step=i_batch, gid=gid)
                     return False
                 valid_count_this_step += 1
-                log.info("valid", component="filter_stale", step=i_batch, gid=gid, staleness=staleness, max_off_policy=cfg.async_config.max_steps_off_policy, stale_count=stale_count_this_step, valid_count=valid_count_this_step)
+                log.debug("valid", component="filter_stale", step=i_batch, gid=gid, staleness=staleness, max_off_policy=cfg.async_config.max_steps_off_policy, stale_count=stale_count_this_step, valid_count=valid_count_this_step)
                 return True
 
             metrics = {
@@ -647,8 +647,8 @@ async def do_async_training(
             nonlocal sampling_client
             nonlocal sampling_client_step
             if cfg.stream_minibatch_config is not None:
-                log.info("putting first group back in queue and calling do_train_step_streaming_and_get_sampling_client", component="training_loop", step=i_batch)
-                log.info("queue sizes before streaming", component="training_loop", step=i_batch, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
+                log.debug("putting first group back in queue and calling do_train_step_streaming_and_get_sampling_client", component="training_loop", step=i_batch)
+                log.debug("queue sizes before streaming", component="training_loop", step=i_batch, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
                 stale_count_this_step = 0
                 valid_count_this_step = 0
                 await trajectory_groups_queue.put(wrapped_trajectory_group)
@@ -667,8 +667,8 @@ async def do_async_training(
                     filter_stale_trajectory_group,
                 )
                 streaming_duration = time.time() - t_streaming_start
-                log.info("do_train_step_streaming_and_get_sampling_client done", component="training_loop", step=i_batch, duration_s=streaming_duration, stale_count=stale_count_this_step, valid_count=valid_count_this_step)
-                log.info("queue sizes after streaming", component="training_loop", step=i_batch, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
+                log.debug("do_train_step_streaming_and_get_sampling_client done", component="training_loop", step=i_batch, duration_s=streaming_duration, stale_count=stale_count_this_step, valid_count=valid_count_this_step)
+                log.debug("queue sizes after streaming", component="training_loop", step=i_batch, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
             else:
                 if not filter_stale_trajectory_group(wrapped_trajectory_group):
                     continue
@@ -679,7 +679,7 @@ async def do_async_training(
                 wrapped_trajectory_groups.append(wrapped_trajectory_group)
                 if len(wrapped_trajectory_groups) < cfg.async_config.groups_per_batch:
                     continue
-                log.info("will train on batch", component="training_loop", step=i_batch, num_groups=len(wrapped_trajectory_groups))
+                log.debug("will train on batch", component="training_loop", step=i_batch, num_groups=len(wrapped_trajectory_groups))
 
                 # Compute sampling client metrics, as samples may have been generated with
                 # different sampler versions
@@ -711,18 +711,18 @@ async def do_async_training(
                         delattr(wg.env_group_builder, "_progress_group_id")
             sampling_client_step = i_batch + 1
             sampling_client_updated_event.set()
-            log.info("updated sampling_client_step", component="training_loop", step=i_batch, sampling_client_step=sampling_client_step)
+            log.debug("updated sampling_client_step", component="training_loop", step=i_batch, sampling_client_step=sampling_client_step)
 
             # Log metrics
             metrics.update(train_step_metrics)
             metrics["time/training_loop/total"] = time.time() - t_start
             ml_logger.log_metrics(metrics, step=i_batch)
-            log.info("completed", component="training_loop", step=i_batch, duration_s=metrics['time/training_loop/total'], next_step=i_batch + 1)
-            log.info("final queue sizes", component="training_loop", step=i_batch, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
+            log.debug("completed", component="training_loop", step=i_batch, duration_s=metrics['time/training_loop/total'], next_step=i_batch + 1)
+            log.debug("final queue sizes", component="training_loop", step=i_batch, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
             i_batch += 1
             wrapped_trajectory_groups = []
 
-        log.info("reached end_batch, calling shutdown_loops()", component="training_loop", end_batch=end_batch)
+        log.debug("reached end_batch, calling shutdown_loops()", component="training_loop", end_batch=end_batch)
         shutdown_loops()
 
     @scope
@@ -912,8 +912,8 @@ async def do_train_step_streaming_and_get_sampling_client(
     )
     groups_per_minibatch = groups_per_substep // cfg.stream_minibatch_config.num_minibatches
 
-    log.info("starting", component="streaming", step=i_batch, groups_per_substep=groups_per_substep, groups_per_minibatch=groups_per_minibatch, num_substeps=cfg.num_substeps)
-    log.info("queue sizes", component="streaming", step=i_batch, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
+    log.debug("starting", component="streaming", step=i_batch, groups_per_substep=groups_per_substep, groups_per_minibatch=groups_per_minibatch, num_substeps=cfg.num_substeps)
+    log.debug("queue sizes", component="streaming", step=i_batch, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
 
     update_scope_context({"step": i_batch})
 
@@ -926,7 +926,7 @@ async def do_train_step_streaming_and_get_sampling_client(
     all_wrapped_trajectory_groups: list[WrappedTrajectoryGroup] = []
 
     for i_substep in range(cfg.num_substeps):
-        log.info("substep starting", component="streaming", step=i_batch, substep=i_substep, num_substeps=cfg.num_substeps, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
+        log.debug("substep starting", component="streaming", step=i_batch, substep=i_substep, num_substeps=cfg.num_substeps, trajectory_groups_qsize=trajectory_groups_queue.qsize(), env_builders_qsize=env_group_builders_queue.qsize())
         substep_gids: set[int] = set()
         fwd_bwd_queue: asyncio.Queue[
             tuple[tinker.APIFuture[tinker.ForwardBackwardOutput], list[tuple[int, int]], list[tinker.Datum]] | None
@@ -939,7 +939,7 @@ async def do_train_step_streaming_and_get_sampling_client(
             filtered_count = 0
             t_producer_start = time.time()
 
-            log.info("starting", component="producer", step=i_batch, substep=i_substep, groups_needed=groups_per_substep, groups_per_minibatch=groups_per_minibatch)
+            log.debug("starting", component="producer", step=i_batch, substep=i_substep, groups_needed=groups_per_substep, groups_per_minibatch=groups_per_minibatch)
 
             while i_group < groups_per_substep:
                 t_wait_start = time.time()
@@ -965,7 +965,7 @@ async def do_train_step_streaming_and_get_sampling_client(
 
                 minibatch_count += 1
                 minibatch_gids = [getattr(g.env_group_builder, "_progress_group_id", "?") for g in minibatch_wgs]
-                log.info("minibatch ready, calling prepare_minibatch", component="producer", step=i_batch, substep=i_substep, minibatch_count=minibatch_count, gids=minibatch_gids)
+                log.debug("minibatch ready, calling prepare_minibatch", component="producer", step=i_batch, substep=i_substep, minibatch_count=minibatch_count, gids=minibatch_gids)
 
                 try:
                     # Prepare and enqueue this minibatch
@@ -980,7 +980,7 @@ async def do_train_step_streaming_and_get_sampling_client(
                         kl_discount_factor=cfg.kl_discount_factor,
                     )
                     prepare_duration = time.time() - t_prepare_start
-                    log.info("prepare_minibatch done", component="producer", step=i_batch, substep=i_substep, minibatch_count=minibatch_count, duration_s=prepare_duration)
+                    log.debug("prepare_minibatch done", component="producer", step=i_batch, substep=i_substep, minibatch_count=minibatch_count, duration_s=prepare_duration)
                     metrics.update(prepare_minibatch_metrics)
 
                     trajectories: list[tuple[int, int]] = []
@@ -993,13 +993,13 @@ async def do_train_step_streaming_and_get_sampling_client(
                                 tracker.mark_trajectory_training_enqueued(gid, tid)
                                 log.debug("marked as enqueued", component="producer", step=i_batch, substep=i_substep, gid=gid, tid=tid)
 
-                    log.info("calling forward_backward_async", component="producer", step=i_batch, substep=i_substep, minibatch_count=minibatch_count, num_trajectories=len(trajectories))
+                    log.debug("calling forward_backward_async", component="producer", step=i_batch, substep=i_substep, minibatch_count=minibatch_count, num_trajectories=len(trajectories))
                     t_fwd_bwd_start = time.time()
                     future = await training_client.forward_backward_async(
                         [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn, loss_fn_config=cfg.loss_fn_config
                     )
                     fwd_bwd_submit_duration = time.time() - t_fwd_bwd_start
-                    log.info("forward_backward_async submitted", component="producer", step=i_batch, substep=i_substep, minibatch_count=minibatch_count, duration_s=fwd_bwd_submit_duration)
+                    log.debug("forward_backward_async submitted", component="producer", step=i_batch, substep=i_substep, minibatch_count=minibatch_count, duration_s=fwd_bwd_submit_duration)
 
                     await fwd_bwd_queue.put((future, trajectories, data_D))
                     all_wrapped_trajectory_groups.extend(minibatch_wgs)
@@ -1017,36 +1017,36 @@ async def do_train_step_streaming_and_get_sampling_client(
                 minibatch_wgs = []
 
             producer_duration = time.time() - t_producer_start
-            log.info("done", component="producer", step=i_batch, substep=i_substep, groups_processed=i_group, minibatch_count=minibatch_count, filtered_count=filtered_count, duration_s=producer_duration)
+            log.debug("done", component="producer", step=i_batch, substep=i_substep, groups_processed=i_group, minibatch_count=minibatch_count, filtered_count=filtered_count, duration_s=producer_duration)
 
             # Enqueue optim_step after all forward_backward
-            log.info("calling optim_step_async", component="producer", step=i_batch, substep=i_substep)
+            log.debug("calling optim_step_async", component="producer", step=i_batch, substep=i_substep)
             adam_params = tinker.AdamParams(
                 learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
             )
             optim_future = await training_client.optim_step_async(adam_params)
-            log.info("optim_step_async submitted, signaling consumer to stop", component="producer", step=i_batch, substep=i_substep)
+            log.debug("optim_step_async submitted, signaling consumer to stop", component="producer", step=i_batch, substep=i_substep)
             await fwd_bwd_queue.put(None)
             return optim_future
 
         async def consumer() -> None:
             consumed_count = 0
             t_consumer_start = time.time()
-            log.info("starting", component="consumer", step=i_batch, substep=i_substep)
+            log.debug("starting", component="consumer", step=i_batch, substep=i_substep)
             while True:
                 log.debug("waiting for item from fwd_bwd_queue", component="consumer", step=i_batch, substep=i_substep, qsize=fwd_bwd_queue.qsize())
                 item = await fwd_bwd_queue.get()
                 if item is None:
                     consumer_duration = time.time() - t_consumer_start
-                    log.info("got none, stopping", component="consumer", step=i_batch, substep=i_substep, consumed_count=consumed_count, duration_s=consumer_duration)
+                    log.debug("got none, stopping", component="consumer", step=i_batch, substep=i_substep, consumed_count=consumed_count, duration_s=consumer_duration)
                     break
                 future, trajectories, data_D = item
                 consumed_count += 1
-                log.info("waiting for forward_backward result", component="consumer", step=i_batch, substep=i_substep, item_num=consumed_count, num_trajectories=len(trajectories))
+                log.debug("waiting for forward_backward result", component="consumer", step=i_batch, substep=i_substep, item_num=consumed_count, num_trajectories=len(trajectories))
                 t_result_start = time.time()
                 result = await future.result_async()
                 result_duration = time.time() - t_result_start
-                log.info("forward_backward result received", component="consumer", step=i_batch, substep=i_substep, item_num=consumed_count, duration_s=result_duration)
+                log.debug("forward_backward result received", component="consumer", step=i_batch, substep=i_substep, item_num=consumed_count, duration_s=result_duration)
                 all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(result))
                 all_data_D.extend(data_D)
                 for gid, tid in trajectories:
@@ -1064,23 +1064,23 @@ async def do_train_step_streaming_and_get_sampling_client(
                 await fwd_bwd_queue.put(None)
                 raise
 
-        log.info("creating producer and consumer tasks", component="streaming", step=i_batch, substep=i_substep)
+        log.debug("creating producer and consumer tasks", component="streaming", step=i_batch, substep=i_substep)
         producer_task = asyncio.create_task(safe_producer())
         consumer_task = asyncio.create_task(consumer())
 
-        log.info("awaiting consumer_task", component="streaming", step=i_batch, substep=i_substep)
+        log.debug("awaiting consumer_task", component="streaming", step=i_batch, substep=i_substep)
         await consumer_task
-        log.info("consumer_task done, awaiting producer_task", component="streaming", step=i_batch, substep=i_substep)
+        log.debug("consumer_task done, awaiting producer_task", component="streaming", step=i_batch, substep=i_substep)
         optim_future = await producer_task
-        log.info("producer_task done", component="streaming", step=i_batch, substep=i_substep)
+        log.debug("producer_task done", component="streaming", step=i_batch, substep=i_substep)
 
         with timed(f"train/optim_substep_{i_substep}_consume", metrics):
-            log.info("waiting for optim_future result", component="streaming", step=i_batch, substep=i_substep)
+            log.debug("waiting for optim_future result", component="streaming", step=i_batch, substep=i_substep)
             await optim_future.result_async()
-            log.info("optim_future result received", component="streaming", step=i_batch, substep=i_substep)
+            log.debug("optim_future result received", component="streaming", step=i_batch, substep=i_substep)
 
         # Remove groups after optim completes
-        log.info("removing groups from tracker", component="streaming", step=i_batch, substep=i_substep, num_groups=len(substep_gids), gids=list(substep_gids))
+        log.debug("removing groups from tracker", component="streaming", step=i_batch, substep=i_substep, num_groups=len(substep_gids), gids=list(substep_gids))
         for gid in substep_gids:
             tracker.remove_group(gid)
 
@@ -1112,7 +1112,7 @@ async def do_train_step_streaming_and_get_sampling_client(
     # Use fire-and-forget (create_task) to avoid blocking - each await put() was taking 12-72s
     # due to event loop starvation from worker coroutines.
     num_to_recycle = len(all_wrapped_trajectory_groups)
-    log.info("recycling builders (fire-and-forget)", component="streaming", step=i_batch, num_to_recycle=num_to_recycle, current_qsize=env_group_builders_queue.qsize())
+    log.debug("recycling builders (fire-and-forget)", component="streaming", step=i_batch, num_to_recycle=num_to_recycle, current_qsize=env_group_builders_queue.qsize())
     for wg in all_wrapped_trajectory_groups:
         if hasattr(wg.env_group_builder, "_progress_group_id"):
             delattr(wg.env_group_builder, "_progress_group_id")
@@ -1120,9 +1120,9 @@ async def do_train_step_streaming_and_get_sampling_client(
             env_group_builders_queue.put(wg.env_group_builder),
             name=f"recycle_builder_step_{i_batch}",
         )
-    log.info("scheduled builders for recycling (non-blocking)", component="streaming", step=i_batch, num_to_recycle=num_to_recycle)
+    log.debug("scheduled builders for recycling (non-blocking)", component="streaming", step=i_batch, num_to_recycle=num_to_recycle)
 
-    log.info("complete, returning sampling_client and metrics", component="streaming", step=i_batch)
+    log.debug("complete, returning sampling_client and metrics", component="streaming", step=i_batch)
     return sampling_client, metrics
 
 
@@ -1286,8 +1286,8 @@ async def main(
         if current_task is not None:
             current_task.set_name("main")
         trace_events_path = os.path.join(cfg.log_path, "trace_events.jsonl")
-        log.info("tracing is enabled", trace_events_path=trace_events_path)
-        log.info("run trace visualization command", command=f"python tinker_cookbook/utils/trace.py {trace_events_path} trace.json", visualization_urls=["chrome://tracing", "https://ui.perfetto.dev/"])
+        log.debug("tracing is enabled", component="rl_train", trace_events_path=trace_events_path)
+        log.debug("run trace visualization command", component="rl_train", command=f"python tinker_cookbook/utils/trace.py {trace_events_path} trace.json", visualization_urls=["chrome://tracing", "https://ui.perfetto.dev/"])
         trace_init(output_file=trace_events_path)
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1307,13 +1307,13 @@ async def main(
                 resume_info["state_path"]
             )
         )
-        log.info("resumed training", state_path=resume_info['state_path'])
+        log.debug("resumed training", component="rl_train", state_path=resume_info['state_path'])
     elif cfg.load_checkpoint_path:
         # Starting fresh from a checkpoint - load weights only (fresh optimizer)
         training_client = await service_client.create_training_client_from_state_async(
             cfg.load_checkpoint_path
         )
-        log.info("loaded weights", checkpoint_path=cfg.load_checkpoint_path)
+        log.debug("loaded weights", component="rl_train", checkpoint_path=cfg.load_checkpoint_path)
     else:
         training_client = await service_client.create_lora_training_client_async(
             cfg.model_name, rank=cfg.lora_rank
@@ -1329,7 +1329,7 @@ async def main(
         evaluators.append(RLTestSetEvaluator(maybe_test_dataset, max_tokens=cfg.max_tokens))
 
     num_batches = len(dataset)
-    log.info("will train on batches", num_batches=num_batches)
+    log.debug("will train on batches", component="rl_train", num_batches=num_batches)
 
     # Training loop
     if cfg.async_config is not None:
@@ -1361,8 +1361,8 @@ async def main(
             loop_state={"batch": num_batches},
         )
     else:
-        log.info("training was already complete; nothing to do")
+        log.debug("training was already complete; nothing to do", component="rl_train")
 
     # Cleanup
     ml_logger.close()
-    log.info("training completed successfully")
+    log.debug("training completed successfully", component="rl_train")

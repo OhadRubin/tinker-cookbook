@@ -25,15 +25,16 @@ def log_results(
     rollouts_per_example: int,
     time_s: float,
 ):
-    log.info("evaluation completed", time_s=round(time_s, 2))
-    log.info(
+    log.debug("evaluation completed", time_s=round(time_s, 2), component="evaluate")
+    log.debug(
         "evaluation config",
         environment=vf_env_id,
         model=model_name,
         num_examples=num_examples,
         rollouts_per_example=rollouts_per_example,
+        component="evaluate",
     )
-    log.info("example section")
+    log.debug("example section", component="evaluate")
     printable_prompts = [messages_to_printable(p) for p in results["prompt"]]
     printable_completions = [messages_to_printable(c) for c in results["completion"]]
     vf.print_prompt_completions_sample(
@@ -41,22 +42,22 @@ def log_results(
     )
     reward_avg = sum(results["reward"]) / len(results["reward"])
     reward_std = np.std(results["reward"])
-    log.info("reward summary", avg=round(reward_avg, 3), std=round(float(reward_std), 3))
+    log.debug("reward summary", avg=round(reward_avg, 3), std=round(float(reward_std), 3), component="evaluate")
     r = rollouts_per_example
     n = len(results["reward"]) // r
     for i in range(r):
         # rounded to 3 decimal places
         trials = [round(results["reward"][(i * n) + j], 3) for j in range(n)]
-        log.info("reward rollout", rollout_index=i + 1, trials=trials)
+        log.debug("reward rollout", rollout_index=i + 1, trials=trials, component="evaluate")
     for k in results["metrics"]:
         v = results["metrics"][k]
         metric_avg = sum(v) / len(v)
         metric_std = np.std(v)
-        log.info("metric summary", metric=k, avg=round(metric_avg, 3), std=round(float(metric_std), 3))
+        log.debug("metric summary", metric=k, avg=round(metric_avg, 3), std=round(float(metric_std), 3), component="evaluate")
         for i in range(r):
             # rounded to 3 decimal places
             trials = [round(v[(i * n) + j], 3) for j in range(n)]
-            log.info("metric rollout", metric=k, rollout_index=i + 1, trials=trials)
+            log.debug("metric rollout", metric=k, rollout_index=i + 1, trials=trials, component="evaluate")
 
 
 async def evaluate(

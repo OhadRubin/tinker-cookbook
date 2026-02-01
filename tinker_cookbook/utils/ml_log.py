@@ -140,7 +140,7 @@ class JsonLogger(Logger):
 
         with open(self.metrics_file, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
-            log.info("wrote metrics", metrics_file=str(self.metrics_file))
+            log.debug("wrote metrics", metrics_file=str(self.metrics_file), component="ml_log")
 
 
 class PrettyPrintLogger(Logger):
@@ -192,7 +192,7 @@ def _maybe_truncate_repr(value: Any) -> str:
 def _rich_console_use_logger(console: Console):
     with console.capture() as capture:
         yield
-    log.info("console output", output="\n" + capture.get().rstrip())
+    log.debug("console output", output="\n" + capture.get().rstrip(), component="ml_log")
     # ^^^ add a leading newline so things like table formatting work properly
 
 
@@ -233,7 +233,7 @@ class WandbLogger(Logger):
         """Log metrics to wandb."""
         if self.run and wandb is not None:
             wandb.log(metrics, step=step, commit=True)
-            log.info("logged metrics", component="wandb", wandb_url=self.run.url)
+            log.debug("logged metrics", component="wandb", wandb_url=self.run.url)
 
     def close(self) -> None:
         """Close wandb run."""
@@ -289,7 +289,7 @@ class NeptuneLogger(Logger):
         if self.run and NeptuneRun is not None:
             assert step is not None, "step is required to be int or float for Neptune logging."
             self.run.log_metrics(metrics, step=step)
-            log.info("logged metrics", component="neptune", neptune_url=self.run.get_run_url())
+            log.debug("logged metrics", component="neptune", neptune_url=self.run.get_run_url())
 
     def close(self) -> None:
         """Close neptune run."""
@@ -329,7 +329,7 @@ class TrackioLogger(Logger):
         """Log metrics to trackio."""
         if self.run and trackio is not None:
             trackio.log(metrics, step=step)
-            log.info("logged metrics", component="trackio", trackio_project=self.run.project)
+            log.debug("logged metrics", component="trackio", trackio_project=self.run.project)
 
     def close(self) -> None:
         """Close trackio run."""
@@ -415,9 +415,9 @@ def setup_logging(
     # Add W&B logger if available and configured
     if wandb_project:
         if not _wandb_available:
-            log.warning("wandb is not installed, skipping W&B logging")
+            log.warning("wandb is not installed, skipping W&B logging", component="ml_log")
         elif not os.environ.get("WANDB_API_KEY"):
-            log.warning("WANDB_API_KEY environment variable not set, skipping W&B logging")
+            log.warning("WANDB_API_KEY environment variable not set, skipping W&B logging", component="ml_log")
         else:
             loggers.append(
                 WandbLogger(
@@ -437,7 +437,7 @@ def setup_logging(
         # if not _neptune_available:
         #     log.warning("neptune-scale is not installed, skipping Neptune logging")
         if not os.environ.get("NEPTUNE_API_TOKEN"):
-            log.warning("NEPTUNE_API_TOKEN environment variable not set, skipping Neptune logging")
+            log.warning("NEPTUNE_API_TOKEN environment variable not set, skipping Neptune logging", component="ml_log")
         else:
             loggers.append(
                 NeptuneLogger(
@@ -457,7 +457,7 @@ def setup_logging(
                 trackio_name=wandb_name,
             )
         )
-        log.info("trackio logging enabled", project=wandb_project)
+        log.debug("trackio logging enabled", project=wandb_project, component="ml_log")
 
     # Create multiplex logger
     ml_logger = MultiplexLogger(loggers)
@@ -469,7 +469,7 @@ def setup_logging(
     if do_configure_logging_module:
         configure_logging_module(str(log_dir_path / "logs.log"))
 
-    log.info("logging initialized", log_dir=str(log_dir_path))
+    log.debug("logging initialized", log_dir=str(log_dir_path), component="ml_log")
     return ml_logger
 
 

@@ -46,6 +46,7 @@ from tinker_cookbook.utils.trace import scope, update_scope_context, trace_init
 
 from observability import log, bootstrap, set_run_id, Events
 
+MAX_MINUTES_TO_RUN_GROUP = 30
 
 def _get_evaluator_name(evaluator: SamplingClientEvaluator) -> str:
     return (
@@ -132,7 +133,9 @@ def print_group(traj_group: TrajectoryGroup, tokenizer: Tokenizer):
         bprint(colorize_example(datum, tokenizer, key="advantages"))
         last_metadata = metadata
     bprint("====== End Trajectory Group ======")
-    log.debug("trajectory_group_printed", component="rl_train", content=buf.getvalue().rstrip())
+    buf_str = buf.getvalue().rstrip()
+    log.info("trajectory_group_printed", component="rl_train", content=buf_str)
+    print(buf_str)
 
 
 def _remove_mask(datum: tinker.Datum) -> tinker.Datum:
@@ -520,55 +523,57 @@ async def do_async_training(
     async def trajectory_group_worker_loop():
         """Generates trajectories for a single env builder"""
         worker_id = id(asyncio.current_task())
-        log.debug("worker started", component="worker", worker_id=worker_id)
+        log.debug("worker started", component="tinker-rl-worker", worker_id=worker_id)
         rollout_count = 0
         while not shutdown_event.is_set():
-            log.debug("waiting for builder from env_group_builders_queue", component="worker", worker_id=worker_id, qsize=env_group_builders_queue.qsize())
+            log.debug("waiting for builder from env_group_builders_queue", component="tinker-rl-worker", worker_id=worker_id, qsize=env_group_builders_queue.qsize())
             env_group_builder = await env_group_builders_queue.get()
             if env_group_builder is None:
-                log.debug("received none, shutting down", component="worker", worker_id=worker_id, rollout_count=rollout_count)
+                log.debug("received none, shutting down", component="tinker-rl-worker", worker_id=worker_id, rollout_count=rollout_count)
                 break
 
-            # Allocate new group ID for requeued builders (stale ones have ID deleted)
-            is_requeued = not hasattr(env_group_builder, "_progress_group_id")
-            if is_requeued:
-                env_group_builder._progress_group_id = tracker.allocate_group_id()
             gid = env_group_builder._progress_group_id
-            log.debug("got builder", component="worker", worker_id=worker_id, gid=gid, requeued=is_requeued, sampling_client_step=sampling_client_step)
+            log.debug("got builder", component="tinker-rl-worker", worker_id=worker_id, gid=gid, sampling_client_step=sampling_client_step)
 
             metrics = {}
             t_start = time.time()
             # Save a reference to the sampling client step in case it changes
             # while we're running the rollout
             sampling_client_step_copy = sampling_client_step
-            log.debug("starting rollout", component="worker", worker_id=worker_id, gid=gid, sampling_client_step_copy=sampling_client_step_copy)
+            log.debug("starting rollout", component="tinker-rl-worker", worker_id=worker_id, gid=gid, sampling_client_step_copy=sampling_client_step_copy)
             try:
-                trajectory_group = await do_group_rollout_and_filter_constant_reward(
-                    sampling_client,
-                    env_group_builder,
-                    max_tokens=cfg.max_tokens,
-                    temperature=cfg.temperature,
-                    do_remove_constant_reward_groups=cfg.remove_constant_reward_groups,
+                trajectory_group = await asyncio.wait_for(
+                    do_group_rollout_and_filter_constant_reward(
+                        sampling_client,
+                        env_group_builder,
+                        max_tokens=cfg.max_tokens,
+                        temperature=cfg.temperature,
+                        do_remove_constant_reward_groups=cfg.remove_constant_reward_groups,
+                    ),
+                    timeout=MAX_MINUTES_TO_RUN_GROUP * 60,
                 )
-            except Exception:
-                log.exception("exception during rollout, recycling builder", component="worker", worker_id=worker_id, gid=gid, duration_s=time.time() - t_start)
-                # Clean up tracker if group was allocated
+            except asyncio.TimeoutError:
                 if hasattr(env_group_builder, "_progress_group_id"):
                     tracker.remove_group(env_group_builder._progress_group_id)
-                    delattr(env_group_builder, "_progress_group_id")
-                # Recycle the builder (fire-and-forget to avoid blocking)
-                asyncio.create_task(
-                    env_group_builders_queue.put(env_group_builder),
-                    name=f"recycle_failed_builder_{worker_id}",
-                )
+                log.error("rollout timed out after 20 minutes", component="tinker-rl-worker", worker_id=worker_id, gid=gid, duration_s=time.time() - t_start)
+                trajectory_groups_queue.put_nowait(None)
                 continue
+            except Exception as e:
+                if hasattr(env_group_builder, "_progress_group_id"):
+                    tracker.remove_group(env_group_builder._progress_group_id)
+                log.exception("exception during rollout", component="tinker-rl-worker", worker_id=worker_id, gid=gid, duration_s=time.time() - t_start)
+                trajectory_groups_queue.put_nowait(None)
+                continue
+
+
             rollout_duration = time.time() - t_start
             rollout_count += 1
             if trajectory_group is None:
-                log.debug("rollout returned none (constant reward filtered)", component="worker", worker_id=worker_id, gid=gid, duration_s=rollout_duration)
+                log.error("rollout returned none (constant reward filtered)", component="tinker-rl-worker", worker_id=worker_id, gid=gid, duration_s=rollout_duration)
                 trajectory_groups_queue.put_nowait(None)
+
             else:
-                log.debug("rollout completed", component="worker", worker_id=worker_id, gid=gid, duration_s=rollout_duration, qsize=trajectory_groups_queue.qsize())
+                log.debug("rollout completed", component="tinker-rl-worker", worker_id=worker_id, gid=gid, duration_s=rollout_duration, qsize=trajectory_groups_queue.qsize())
                 metrics["time/trajectory_group_worker_loop/total"] = rollout_duration
                 trajectory_groups_queue.put_nowait(
                     WrappedTrajectoryGroup(
@@ -578,7 +583,7 @@ async def do_async_training(
                         metrics=metrics,
                     )
                 )
-                log.debug("successfully put in trajectory_groups_queue", component="worker", worker_id=worker_id, gid=gid, new_qsize=trajectory_groups_queue.qsize())
+                log.debug("successfully put in trajectory_groups_queue", component="tinker-rl-worker", worker_id=worker_id, gid=gid, new_qsize=trajectory_groups_queue.qsize())
 
     @scope
     async def training_loop():
@@ -776,6 +781,8 @@ async def do_group_rollout_and_filter_constant_reward(
 
     with logtree.optional_enable_logging(enable_logging):
         trajectory_group = await do_group_rollout(env_group_builder, policy)
+    if trajectory_group is None:
+        return None
 
     # Remove if all trajectories have the same reward
     if do_remove_constant_reward_groups and all_same(trajectory_group.get_total_rewards()):

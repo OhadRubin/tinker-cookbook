@@ -110,7 +110,10 @@ class CLIConfig:
     clip_low_threshold: float | None = None  # PPO clip low (e.g. 0.8 means 1 - epsilon_low = 0.8)
     clip_high_threshold: float | None = None  # PPO clip high (e.g. 1.25 means 1 + epsilon_high = 1.25)
 
-    # logging configuration
+    # data filtering
+    remove_constant_reward_groups: bool  # Filter out groups where all trajectories have same reward (zero advantage)
+
+    # .ging configuration
     eval_every: int = 0
     save_every: int = 10
     log_path: str | None = None
@@ -180,15 +183,29 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
             "temperature": cli_config.temperature,
         }
 
-        async def run_rollout_with_context(traj_idx: int, rollout_input):
+        async def run_rollout_with_context(traj_idx: int, rollout_input, max_retries: int = 30):
             set_trajectory_context(group_id, traj_idx)
             try:
-                result = await vf_builder.vf_env.run_rollout(
-                    rollout_input, shared_client, "tinker", gen_sampling_args, gen_sem
-                )
-                token_counts = extract_num_tokens_from_state(result)
-                tracker.mark_trajectory_sampled(group_id, traj_idx, token_counts["total_tokens"])
-                return result
+                result: vf.State | None = None
+                backoff_seconds = 1
+                for attempt in range(max_retries):
+                    result = await vf_builder.vf_env.run_rollout(
+                        rollout_input, shared_client, "tinker", gen_sampling_args, gen_sem
+                    )
+                    error = result.get("error", None)
+                    if isinstance(error, vf.Error):
+                        # TODO: we will consider adding a feature that would check if a lot of trajectories failed and pause everything
+                        # or a feature that would reset backoff_seconds according to a switch i could toggle via a file?
+                        log.error("run_rollout_with_context attempt failed", component="verifiers_rl", content=str(error), group_id=group_id, traj_idx=traj_idx, attempt=attempt, backoff_seconds=backoff_seconds)
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(backoff_seconds)
+                            backoff_seconds *= 2
+                            continue
+                        log.error("all run_rollout_with_context attempts failed", component="verifiers_rl", content=str(error), group_id=group_id, traj_idx=traj_idx)
+                        return result
+                    token_counts = extract_num_tokens_from_state(result)
+                    tracker.mark_trajectory_sampled(group_id, traj_idx, token_counts["total_tokens"])
+                    return result
             finally:
                 clear_trajectory_context()
 
@@ -247,6 +264,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         save_every=cli_config.save_every,
         loss_fn=cli_config.loss_fn,
         loss_fn_config=loss_fn_config,
+        remove_constant_reward_groups=cli_config.remove_constant_reward_groups,
         async_config=train.AsyncConfig(
             max_steps_off_policy=cli_config.max_steps_off_policy,
             groups_per_batch=cli_config.groups_per_batch,

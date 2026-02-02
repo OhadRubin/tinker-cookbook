@@ -175,8 +175,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         gen_sem = shared_gen_sem
         score_sem = shared_score_sem
 
-        group_id: int = builder._progress_group_id
-        tracker = TrajectoryProgressTracker.get_instance()
+        # group_id: int = builder._progress_group_id
+        # tracker = TrajectoryProgressTracker.get_instance()
 
         gen_sampling_args = {
             "max_tokens": cli_config.max_tokens,
@@ -184,7 +184,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         }
 
         async def run_rollout_with_context(traj_idx: int, rollout_input, max_retries: int = 30):
-            set_trajectory_context(group_id, traj_idx)
+            # set_trajectory_context(group_id, traj_idx)
             try:
                 result: vf.State | None = None
                 backoff_seconds = 1
@@ -196,15 +196,19 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                     if isinstance(error, vf.Error):
                         # TODO: we will consider adding a feature that would check if a lot of trajectories failed and pause everything
                         # or a feature that would reset backoff_seconds according to a switch i could toggle via a file?
-                        log.error("run_rollout_with_context attempt failed", component="verifiers_rl", content=str(error), group_id=group_id, traj_idx=traj_idx, attempt=attempt, backoff_seconds=backoff_seconds)
+                        log.error("run_rollout_with_context attempt failed", component="verifiers_rl", content=str(error),
+                        #  group_id=group_id, traj_idx=traj_idx,
+                          attempt=attempt, backoff_seconds=backoff_seconds)
                         if attempt < max_retries - 1:
                             await asyncio.sleep(backoff_seconds)
                             backoff_seconds *= 2
                             continue
-                        log.error("all run_rollout_with_context attempts failed", component="verifiers_rl", content=str(error), group_id=group_id, traj_idx=traj_idx)
+                        log.error("all run_rollout_with_context attempts failed", component="verifiers_rl", content=str(error), 
+                        # group_id=group_id, traj_idx=traj_idx
+                        )
                         return result
                     token_counts = extract_num_tokens_from_state(result)
-                    tracker.mark_trajectory_sampled(group_id, traj_idx, token_counts["total_tokens"])
+                    # tracker.mark_trajectory_sampled(group_id, traj_idx, token_counts["total_tokens"])
                     return result
             finally:
                 clear_trajectory_context()
@@ -217,7 +221,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         await vf_builder.vf_env.rubric.score_group(states, score_sem=score_sem)
 
         rewards = [state.get("reward") or 0.0 for state in states]
-        tracker.complete_group(group_id, rewards)
+        # tracker.complete_group(group_id, rewards)
 
         return convert_states_to_trajectory_group(states)
 
@@ -232,13 +236,13 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         dataset_seed=cli_config.dataset_seed,
     )
 
-    tracker = TrajectoryProgressTracker.get_instance()
-    tracker.configure(
-        max_tokens=65536,
-        group_size=cli_config.group_size,
-        enabled=True,
-        refresh_rate=4.0,
-    )
+    # tracker = TrajectoryProgressTracker.get_instance()
+    # tracker.configure(
+    #     max_tokens=65536,
+    #     group_size=cli_config.group_size,
+    #     enabled=True,
+    #     refresh_rate=4.0,
+    # )
 
     loss_fn_config: dict[str, float] | None = None
     if cli_config.clip_low_threshold is not None or cli_config.clip_high_threshold is not None:

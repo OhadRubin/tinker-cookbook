@@ -192,12 +192,14 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             completion_token_ids: List[int] = seq.tokens
             logprobs: List[float] = seq.logprobs or [0.0] * len(completion_token_ids)
 
-            group_id, traj_idx = get_trajectory_context()
-            if group_id is not None:
-                assert traj_idx is not None
-                tracker = TrajectoryProgressTracker.get_instance()
-                context_length = len(prompt_token_ids)
-                tracker.track_llm_call(group_id, context_length, traj_idx)
+            context_length = len(prompt_token_ids)
+            # TODO: instead, we will do  set_trajectory_context(len(prompt_token_ids))
+
+            # group_id, traj_idx = get_trajectory_context()
+            # if group_id is not None:
+            #     assert traj_idx is not None
+            #     tracker = TrajectoryProgressTracker.get_instance()
+            #     tracker.track_llm_call(group_id, context_length, traj_idx)
 
             assistant_message, parse_success = renderer.parse_response(
                 completion_token_ids

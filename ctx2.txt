@@ -1,0 +1,1333 @@
+[USER]
+read the following files and suggest a better abstraction for the tracker
+/home/ohadr/tinker-self-hosting/train.py.patch
+/home/ohadr/tinker-cookbook/tinker_cookbook/recipes/verifiers_rl/verifiers_env.py
+/home/ohadr/tinker-cookbook/tinker_cookbook/utils/trajectory_progress.py
+
+[THINKING]
+The user wants me to read three files and suggest a better abstraction for the tracker. Let me read all three files first.
+
+[THINKING]
+The user wants me to analyze these three files and suggest a better abstraction for the tracker. Let me understand the current implementation:
+
+## Current State
+
+### `trajectory_progress.py`
+A progress tracking system that:
+1. Uses a singleton pattern (`TrajectoryProgressTracker.get_instance()`)
+2. Tracks trajectory state through their lifecycle: PENDING → IN_PROGRESS → SAMPLED → COMPLETED
+3. Also tracks training status: "pending" → "enqueued" → "done"
+4. Writes state to `/tmp/trajectory_progress.json` for external visualization
+5. Has a `watch()` function that renders a rich terminal dashboard
+
+Key methods:
+- `configure()` - sets max_tokens, group_size, enabled
+- `start_continuous()` - context manager for async training (continuous streaming mode)
+- `track_batch()` - context manager for sync training
+- `allocate_group_id()` - returns a new unique group ID
+- `track_llm_call()` - updates tokens generated per trajectory
+- `mark_trajectory_sampled()` - when sampling is done
+- `complete_group()` - when all rewards are collected
+- `remove_group()` - cleanup after training
+- `mark_trajectory_training_enqueued()` / `mark_trajectory_fwd_bwd_done()` - training lifecycle
+
+Problems I see:
+1. **Coupling**: The tracker is tightly coupled to the training loop - there's `_progress_group_id` being attached/detached from `EnvGroupBuilder` objects (line 102, 141-144 in patch, etc.)
+2. **State management complexity**: Multiple places need to call tracker methods - leads to scattered updates
+3. **Global singleton**: Makes testing hard, creates implicit dependencies
+4. **Manual lifecycle management**: Callers must remember to remove groups, handle exceptions, etc.
+5. **Hardcoded config**: `NUM_TRAINING_GROUPS = 32` (line 32)
+
+
+6. **Tangled responsibilities**: Core tracking logic is mixed with visualization concerns like `watch()`, `RollingStats`, and JSON serialization
+
+### `train.py.patch`
+Shows how the tracker is integrated:
+- `builder._progress_group_id = gid` (line 192) - monkeypatching the builder
+- Many places call `tracker.mark_trajectory_training_enqueued()`, `tracker.mark_trajectory_fwd_bwd_done()`, `tracker.remove_group()`
+- Exception handling needs to also remove groups (line 242-243, 249-250)
+- Cleanup is scattered across the code
+
+### `verifiers`
+
+_env.py`
+This file defines `VerifiersEnvGroupBuilder` and doesn't directly use the tracker. But the patch shows that the train.py patches `_progress_group_id` onto builders.
+
+## Problems with Current Design
+
+1. **Invasive**: Requires monkeypatching `_progress_group_id` onto `EnvGroupBuilder`
+2. **Error-prone**: Many places must call tracker methods - easy to forget or mess up
+3. **Scattered lifecycle**: Group creation, updates, and removal happen in different places
+4. **No abstraction for "tracked group"**: Just raw group IDs passed around
+
+## Suggested Better Abstraction
+
+### Option 1: Context Manager Based
+Create a `TrackedGroup` context manager that automatically handles group lifecycle:
+
+```python
+class TrackedGroup:
+    """Context manager that handles group lifecycle with the tracker."""
+    def __init__(self, tracker, group_id):
+        self.tracker = tracker
+        self.group_id = group_id
+    
+    def __enter__(self):
+        return self.group_id
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.tracker.remove_group(self.group_id)
+        return False
+```
+
+Then usage becomes:
+```python
+with TrackedGroup(tracker, gid) as group_id:
+    # Do work with group_id
+    # Automatic cleanup on exit
+```
+
+This eliminates scattered cleanup calls and makes the lifecycle explicit.
+
+### Option 2: Builder Wrapper / Decorator Pattern
+Wrap the `EnvGroupBuilder` with tracking behavior:
+
+```python
+class TrackedEnvGroupBuilder:
+    """Wraps an EnvGroupBuilder and automatically integrates with progress tracking."""
+    def __init__(self, builder, tracker):
+        self.builder = builder
+        self.tracker = tracker
+        self.group_id = tracker.allocate_group_id()
+    
+    def build(self):
+        env = self.builder.build()
+        self.tracker.update_group(self.group_id, env)
+        return env
+```
+
+This approach keeps tracking logic encapsulated within the wrapper, so the builder itself stays clean and the tracker integration happens transparently during the build process.
+
+### Option 3: Event-Based / Observer Pattern
+Instead of direct method calls, use an event system where the trainer emits signals:
+
+```python
+class TrainingEvents:
+    def __init__(self):
+        self.listeners = []
+    
+    def group_started(self, group_id): ...
+    def trajectory_sampled(self, group_id, traj_id): ...
+    def group_completed(self, group_id): ...
+```
+
+Listeners subscribe to these events and react accordingly, decoupling the trainer from specific tracking implementations.
+
+### Option 4: Protocol-based abstraction
+Define protocols that specify the minimal interface needed:
+
+```python
+class TrackableGroup(Protocol):
+    @property
+    def tracking_id(self) -> int: ...
+
+class GroupTrackingHandle:
+    def update_trajectory(self, idx: int, tokens: int): ...
+    def mark_sampled(self, idx: int): ...
+    def complete(self, rewards: list[float]): ...
+```
+
+This approach uses RAII-style handles that automatically clean up when they go out of scope, removing the need for explicit cleanup calls.
+
+### Recommended approach
+
+Split the tracking logic into separate modules—one for core tracking operations and another for display/visualization. Use handle objects returned from `tracker.track_group()` that manage their own lifecycle through `__del__`, eliminating the need to attach state directly to builder objects. Instead of monkeypatching attributes onto instances, pass the handle explicitly through function calls or store it in a context manager.
+
+An async context manager wrapping the entire group lifecycle would clean up the train.py code significantly—replacing the current pattern of manual allocation, try/except blocks, and scattered cleanup calls with a single `async with tracked_rollout(tracker, builder):` block that handles setup and teardown automatically.
+
+[ASSISTANT]
+## Analysis: Current Tracker Design Issues
+
+After reading the files, I see several problems with the current `TrajectoryProgressTracker` design:
+
+### Problems
+
+1. **Invasive monkeypatching** (patch lines 102, 192-193, 213):
+   ```python
+   builder._progress_group_id = gid  # attached
+   # ... later ...
+   delattr(builder, "_progress_group_id")  # detached
+   ```
+
+2. **Scattered lifecycle management** - group creation, updates, and removal happen in 10+ places across `train.py` with manual `if hasattr(...): delattr(...)` cleanup
+
+3. **Error-prone exception handling** (patch lines 242-250):
+   ```python
+   except Exception:
+       if hasattr(env_group_builder, "_progress_group_id"):
+           tracker.remove_group(...)  # easy to forget
+   ```
+
+4. **Global singleton** makes testing hard, creates implicit dependencies
+
+5. **Mixed concerns** - core tracking (lines 91-290) mixed with 650+ lines of visualization code (`watch()`, `RollingStats`, etc.)
+
+---
+
+## Suggested Abstraction: RAII-style GroupHandle
+
+**Core idea**: Return a handle object that automatically manages lifecycle:
+
+```python
+# progress_tracker.py (split from display code)
+
+@dataclass
+class GroupHandle:
+    """RAII-style handle. Auto-cleans on close or __del__."""
+    tracker: TrajectoryProgressTracker
+    group_id: int
+    _closed: bool = False
+    
+    def track_llm_call(self, traj_idx: int, tokens: int) -> None:
+        self.tracker.track_llm_call(self.group_id, tokens, traj_idx)
+    
+    def mark_sampled(self, traj_idx: int, tokens: int) -> None:
+        self.tracker.mark_trajectory_sampled(self.group_id, traj_idx, tokens)
+    
+    def complete(self, rewards: list[float]) -> None:
+        self.tracker.complete_group(self.group_id, rewards)
+    
+    def mark_training_enqueued(self, traj_idx: int) -> None:
+        self.tracker.mark_trajectory_training_enqueued(self.group_id, traj_idx)
+    
+    def mark_fwd_bwd_done(self, traj_idx: int) -> None:
+        self.tracker.mark_trajectory_fwd_bwd_done(self.group_id, traj_idx)
+    
+    def close(self) -> None:
+        if not self._closed:
+            self.tracker.remove_group(self.group_id)
+            self._closed = True
+    
+    def __del__(self):
+        self.close()
+
+
+class TrajectoryProgressTracker:
+    # ... existing code ...
+    
+    def track_group(self) -> GroupHandle:
+        """Create a new tracked group, returning a handle for updates."""
+        gid = self.allocate_group_id()
+        return GroupHandle(tracker=self, group_id=gid)
+```
+
+**Usage in train.py becomes**:
+
+```python
+# Before (scattered, error-prone)
+gid = tracker.allocate_group_id()
+env_group_builder._progress_group_id = gid
+try:
+    result = await do_rollout(...)
+except Exception:
+    if hasattr(env_group_builder, "_progress_group_id"):
+        tracker.remove_group(gid)
+        delattr(env_group_builder, "_progress_group_id")
+    raise
+# ... 50 lines later ...
+for tid in range(len(traj_group.trajectories_G)):
+    tracker.mark_trajectory_fwd_bwd_done(gid, tid)
+tracker.remove_group(gid)
+if hasattr(builder, "_progress_group_id"):
+    delattr(builder, "_progress_group_id")
+
+# After (encapsulated, auto-cleanup)
+handle = tracker.track_group()
+try:
+    result = await do_rollout(...)
+    handle.complete(rewards)
+    for tid in range(...):
+        handle.mark_fwd_bwd_done(tid)
+finally:
+    handle.close()  # or let __del__ handle it
+```
+
+---
+
+## Additional Improvements
+
+| Current | Proposed |
+|---------|----------|
+| `_progress_group_id` on builder | `@dataclass TrackedRollout: builder, handle` |
+| 900-line file | Split: `progress_tracker.py` (core), `progress_display.py` (watch) |
+| Singleton `get_instance()` | Dependency injection: pass tracker to train loop |
+| `NUM_TRAINING_GROUPS = 32` hardcoded | Part of `configure()` or constructor arg |
+
+---
+
+## File Structure Suggestion
+
+```
+tinker_cookbook/utils/
+├── progress/
+│   ├── __init__.py          # exports GroupHandle, TrajectoryProgressTracker
+│   ├── tracker.py           # ~150 lines: TrajectoryProgressTracker, GroupHandle
+│   ├── types.py             # TrajectoryState, GroupState, TrajectoryStatus
+│   └── display.py           # ~700 lines: watch(), RollingStats, build_dashboard
+```
+
+This separates the **tracking responsibility** (used by train.py) from the **display responsibility** (used by the watcher script).
+
+[USER]
+do we EVEN really need to do that?
+
+[THINKING]
+The user is questioning whether we even need this complexity. Let me think about what the tracker actually does and whether it's necessary.
+
+Looking at the code:
+
+1. `TrajectoryProgressTracker` writes state to `/tmp/trajectory_progress.json`
+2. A separate `watch()` process reads this file and displays a rich terminal dashboard
+3. The tracker is called from many places in train.py to update progress
+
+The question is: is all this tracking complexity worth it? What value does it provide?
+
+The main value seems to be:
+- Real-time visibility into training progress via the terminal dashboard
+- Debugging/monitoring rollouts and training pipeline
+
+But the cost is:
+- ~900 lines of code
+- Invasive integration into train.py (the patch adds a lot of tracker calls)
+- Complexity and potential bugs
+- Monkeypatching builders
+
+Let me think about alternatives:
+
+1. **Just use logging** - The patch already adds extensive `log.debug()` calls. Could just tail logs instead of a custom dashboard.
+
+2. **Metrics only** - Use `ml_log.log_metrics()` which already exists. WandB/TensorBoard can show progress.
+
+3. **Simpler progress bar** - tqdm or rich.progress for basic "X/Y groups done"
+
+4. **Remove entirely** - If the logging is sufficient, maybe the tracker isn't needed at all.
+
+The user seems to be questioning whether the abstraction improvement is worth it, OR whether the whole tracker concept is worth it. Given the "do we EVEN really need to do that?" phrasing, I think they're questioning the whole thing.
+
+Let me be direct: the tracker seems like over-engineering for what could be achieved with simpler means.
+
+[USER]
+what objects are we always operating on? can't those objects have methods that denote obj.set ...
+
+[ASSISTANT]
+[Request interrupted by user]
+
+[USER]
+do we EVEN really need to do that?  what objects are we always operating on? can't those objects have methods that denote obj.set(enum_value)
+
+[THINKING]
+The user is pushing back on my suggestion and asking a more fundamental question: do we even need the tracker abstraction at all? They're suggesting that the objects we're operating on (likely `TrajectoryState` or the trajectories themselves) could just have methods like `obj.set(enum_value)` to update their state directly.
+
+Let me think about what objects are always being operated on:
+
+1. `TrajectoryState` - has `status`, `training_status`, `tokens_generated`, etc.
+2. `GroupState` - has `trajectories: dict[int, TrajectoryState]`
+3. `EnvGroupBuilder` - the builder objects that get `_progress_group_id` monkeypatched onto them
+4. `TrajectoryGroup` - the result of rollouts
+
+The current flow:
+1. `EnvGroupBuilder` is created
+2. A `_progress_group_id` is attached to it
+3. During rollout, `tracker.track_llm_call(group_id, tokens, traj_idx)` is called
+4. When done, `tracker.complete_group(group_id, rewards)` is called
+5. For training: `tracker.mark_trajectory_training_enqueued(group_id, traj_idx)`
+6. Then: `tracker.mark_trajectory_fwd_bwd_done(group_id, traj_idx)`
+7. Finally: `tracker.remove_group(group_id)`
+
+The user is right - we're always operating on:
+- A specific trajectory within a group
+- Or a group as a whole
+
+The fundamental objects are:
+1. The group (represented by `EnvGroupBuilder` during rollout, becomes `TrajectoryGroup` after)
+2. Individual trajectories within the group
+
+So their suggestion is: instead of having a separate `TrajectoryProgressTracker` that maintains a parallel data structure (`_groups: dict[int, GroupState]`) and requires ID-based lookups, why not just put the tracking state directly on the objects themselves?
+
+
+Instead of a separate tracker maintaining parallel state, I could embed the progress tracking directly into the objects being operated on. For instance, `TrajectoryState` could have methods like `set_status()` that update its state and trigger persistence, or `EnvGroupBuilder` could carry a `progress` field holding all trajectory states with methods like `mark_trajectory_sampled(idx, tokens)` that directly mutate the state. This eliminates the indirection of ID-based lookups and keeps the state colocated with the objects themselves. .SAMPLED)
+```
+
+The core question becomes how to persist these state changes. I could trigger writes on each update, use a background thread for periodic serialization, or implement an observer pattern where objects notify a central writer. 
+
+Looking at the actual structure, `EnvGroupBuilder` persists throughout the rollout while `TrajectoryGroup` forms afterward. The patch reveals `builder._progress_group_id` connects the builder to tracking state. A cleaner design would attach progress tracking directly to `EnvGroupBuilder` as a `GroupProgress` dataclass containing the group ID and trajectory states, eliminating the need for external registries entirely. builder.progress = GroupProgress(group_id=i, trajectories=[...])
+# ... later ...
+builder.progress.trajectories[tid].set_status(TrajectoryStatus.SAMPLED)
+```
+
+The `ProgressWriter` acts as a simple registry, maintaining weak references to all active `GroupProgress` instances and periodically serializing them to JSON. Each group automatically removes itself from tracking when garbage collected, eliminating manual cleanup. The writer just iterates through registered groups and writes their state to disk—no complex state management needed.
+
+[ASSISTANT]
+You're right. Let me reconsider.
+
+**Objects we're always operating on:**
+1. `EnvGroupBuilder` - lives throughout rollout
+2. Individual trajectories within that group
+
+**Current indirection:**
+```
+EnvGroupBuilder → _progress_group_id (int) → tracker._groups[gid] → GroupState → TrajectoryState
+```
+
+**Simpler approach - state lives on the object itself:**
+
+```python
+@dataclass
+class TrajectoryProgress:
+    status: TrajectoryStatus = TrajectoryStatus.PENDING
+    training_status: str = "pending"  # or enum
+    tokens: int = 0
+    reward: float | None = None
+    
+    def set_status(self, status: TrajectoryStatus): 
+        self.status = status
+
+@dataclass
+class GroupProgress:
+    trajectories: list[TrajectoryProgress]
+    start_time: float = field(default_factory=time.time)
+```
+
+Then `EnvGroupBuilder` just gets:
+```python
+class EnvGroupBuilder:
+    progress: GroupProgress | None = None  # attached when tracking enabled
+```
+
+**Usage becomes:**
+```python
+builder.progress = GroupProgress(trajectories=[TrajectoryProgress() for _ in range(group_size)])
+
+# During rollout:
+builder.progress.trajectories[tid].set_status(TrajectoryStatus.IN_PROGRESS)
+builder.progress.trajectories[tid].tokens = 1234
+
+# After scoring:
+builder.progress.trajectories[tid].set_status(TrajectoryStatus.COMPLETED)
+builder.progress.trajectories[tid].reward = 0.5
+```
+
+**The "tracker" becomes just a writer:**
+```python
+class ProgressWriter:
+    groups: weakref.WeakSet[GroupProgress]  # auto-removed on GC
+    
+    def register(self, group: GroupProgress): self.groups.add(group)
+    def write(self): ...  # serialize all groups to JSON
+```
+
+No ID allocation, no lookups, no monkeypatching, no manual cleanup. The state lives where it belongs.
+
+[USER]
+great now read /home/ohadr/tinker-cookbook/tinker_cookbook/recipes/verifiers_rl/verifiers_env.py again
+
+[THINKING]
+The user wants me to read the verifiers_env.py file again, probably to see how the new simpler abstraction would fit in with the existing code structure.
+
+[THINKING]
+Now I see it more clearly. The `VerifiersEnvGroupBuilder` is created at line 100-108 in `get_batch()`. It's a simple class with no progress tracking built in.
+
+The user's point is: why not just add `progress: GroupProgress | None = None` directly to `EnvGroupBuilder` (the base class) or `VerifiersEnvGroupBuilder`?
+
+Then instead of:
+```python
+builder._progress_group_id = gid  # monkeypatching
+tracker.track_llm_call(gid, tokens, traj_idx)  # lookup by ID
+```
+
+It becomes:
+```python
+builder.progress = GroupProgress(...)  # proper attribute
+builder.progress.trajectories[traj_idx].tokens = tokens  # direct access
+```
+
+The `EnvGroupBuilder` base class (in `rl/types.py`) should define the `progress` attribute. Let me think about where that base class is defined...
+
+Looking at the imports:
+```python
+from tinker_cookbook.rl.types import (
+    EnvGroupBuilder,
+    ...
+)
+```
+
+So I should probably look at `tinker_cookbook/rl/types.py` to see the base class definition. But the user's point is clear - the object already exists (`VerifiersEnvGroupBuilder`), just add the progress state to it instead of maintaining a separate registry.
+
+The flow would be:
+1. `VerifiersRLDataset.get_batch()` creates `VerifiersEnvGroupBuilder` instances
+2. When tracking is enabled, set `builder.progress = GroupProgress(...)`
+3. During rollout, update `builder.progress.trajectories[i].status = ...`
+4. The writer just iterates over all builders with non-None progress
+
+This is much simpler than the current approach with ID allocation, lookups, and cleanup.
+
+[ASSISTANT]
+Now I see it clearly. `VerifiersEnvGroupBuilder` is the object that persists throughout the entire lifecycle. It's created at line 100-108, used during rollout, and still available when training happens.
+
+**The progress state should just live on it:**
+
+```python
+class VerifiersEnvGroupBuilder(EnvGroupBuilder):
+    def __init__(self, ...):
+        self.vf_env = vf_env
+        self.prompt = prompt
+        # ... existing fields ...
+        self.progress: GroupProgress | None = None  # <-- add this
+```
+
+Or better, add it to the base `EnvGroupBuilder` in `rl/types.py` so all builders get it.
+
+**Then usage in train.py becomes:**
+
+```python
+# Instead of:
+gid = tracker.allocate_group_id()
+builder._progress_group_id = gid
+tracker.track_llm_call(gid, tokens, traj_idx)
+tracker.mark_trajectory_training_enqueued(gid, tid)
+tracker.remove_group(gid)
+delattr(builder, "_progress_group_id")
+
+# Just:
+builder.progress = GroupProgress(group_size)
+builder.progress.trajectories[traj_idx].tokens = tokens
+builder.progress.trajectories[traj_idx].status = TrajectoryStatus.IN_PROGRESS
+builder.progress.trajectories[tid].training_status = "enqueued"
+builder.progress = None  # cleanup (or let GC handle it)
+```
+
+**The "tracker" becomes trivial** - just collects builders with `progress is not None` and writes JSON:
+
+```python
+class ProgressWriter:
+    def write(self, builders: Iterable[EnvGroupBuilder]):
+        groups = {i: b.progress.to_dict() for i, b in enumerate(builders) if b.progress}
+        PROGRESS_FILE.write_text(json.dumps({"groups": groups}))
+```
+
+No IDs, no registry, no lookups, no monkeypatching. The state lives on the object it describes.
+
+[USER]
+run this `ohadr@v4-8-node-2:~/tinker-cookbook$ rg tracker` and read related files
+
+[THINKING]
+The user wants me to run a grep for "tracker" in the tinker-cookbook directory to find all related files.
+
+[BASH]
+rg tracker
+
+[THINKING]
+Interesting - all the tracker usages are commented out! Let me read the related files to see the current state.
+
+[ASSISTANT]
+Interesting - all tracker usages are commented out. Let me read the relevant files.
+
+[THINKING]
+Now I see the full picture. All tracker usages are commented out. The key locations where tracking would happen are:
+
+1. `train.py` line 178-179: `group_id: int = builder._progress_group_id` and `tracker = TrajectoryProgressTracker.get_instance()` - commented out
+2. `train.py` line 187: `set_trajectory_context(group_id, traj_idx)` - commented out
+3. `train.py` line 211: `tracker.mark_trajectory_sampled(group_id, traj_idx, token_counts["total_tokens"])` - commented out
+4. `train.py` line 224: `tracker.complete_group(group_id, rewards)` - commented out
+5. `train.py` lines 239-245: tracker configuration - commented out
+
+6. `tinker_openai.py` lines 196-200: tracking LLM calls - commented out
+
+The key insight is:
+- `builder` is a `VerifiersEnvGroupBuilder` (cast at line 168)
+- It persists through the entire `custom_do_group_rollout` function
+- Inside `run_rollout_with_context`, `traj_idx` is available
+- The builder already has access to all the information needed
+
+So the simpler design would be:
+
+```python
+# In verifiers_env.py - add progress to the builder
+class VerifiersEnvGroupBuilder(EnvGroupBuilder):
+    def __init__(self, ...):
+        # ... existing fields ...
+        self.progress: GroupProgress | None = None
+
+# In train.py - create progress when starting rollout
+vf_builder = cast(VerifiersEnvGroupBuilder, builder)
+vf_builder.progress = GroupProgress(group_size=cli_config.group_size)
+
+# Inside run_rollout_with_context - update progress directly
+
+
+vf_builder.progress.trajectories[traj_idx].tokens = token_counts["total_tokens"]
+vf_builder.progress.trajectories[traj_idx].status = TrajectoryStatus.SAMPLED
+
+# After scoring
+for i, reward in enumerate(rewards):
+    vf_builder.progress.trajectories[i].reward = reward
+    vf_builder.progress.trajectories[i].status = TrajectoryStatus.COMPLETED
+```
+
+This approach is much cleaner than the current ID-based registry pattern. The progress state naturally belongs on the builder itself since it already carries all the context needed throughout the rollout lifecycle.
+
+[ASSISTANT]
+Now I see it clearly. The `VerifiersEnvGroupBuilder` (`vf_builder` at line 168) is the object that:
+
+1. Persists through the entire `custom_do_group_rollout`
+2. Has `traj_idx` available inside `run_rollout_with_context`
+3. Is passed around everywhere
+
+**The commented-out code shows the pain:**
+```python
+# line 178-179: Getting group_id from monkeypatched attribute
+group_id: int = builder._progress_group_id
+tracker = TrajectoryProgressTracker.get_instance()
+
+# line 187: Setting context vars to pass group_id/traj_idx through call stack
+set_trajectory_context(group_id, traj_idx)
+
+# line 196-200 in tinker_openai.py: Retrieving from context vars
+group_id, traj_idx = get_trajectory_context()
+tracker.track_llm_call(group_id, context_length, traj_idx)
+```
+
+**With state on the builder, it becomes:**
+
+```python
+# verifiers_env.py line 140+
+class VerifiersEnvGroupBuilder(EnvGroupBuilder):
+    def __init__(self, ...):
+        # ... existing ...
+        self.progress: GroupProgress | None = None
+
+# train.py - at rollout start
+vf_builder.progress = GroupProgress(group_size=cli_config.group_size)
+
+# train.py line 210-211 - after sampling
+vf_builder.progress.trajectories[traj_idx].tokens = token_counts["total_tokens"]
+vf_builder.progress.trajectories[traj_idx].status = TrajectoryStatus.SAMPLED
+
+# train.py line 223-224 - after scoring  
+for i, reward in enumerate(rewards):
+    vf_builder.progress.trajectories[i].reward = reward
+```
+
+**For tinker_openai.py** - pass the builder (or just `progress`) to `TinkerAsyncOpenAIClient`:
+
+```python
+# Instead of context vars:
+shared_client = TinkerAsyncOpenAIClient(..., progress=vf_builder.progress)
+
+# Or even simpler - pass traj_idx and progress to run_rollout_with_context:
+async def run_rollout_with_context(traj_idx: int, rollout_input, progress: TrajectoryProgress):
+    # progress is vf_builder.progress.trajectories[traj_idx]
+    ...
+    progress.tokens = context_length  # direct update
+```
+
+No IDs, no registry, no context vars, no monkeypatching. The state lives on the object it describes.
+
+[USER]
+no, i like it living inside the object see /home/ohadr/verifiers/verifiers/types.py
+
+[THINKING]
+The user wants me to look at the verifiers types.py file to see where the state should naturally live.
+
+[THINKING]
+Now I see it. The `State` class (lines 95-136) is where the trajectory state lives. It already has:
+- `trajectory: list[TrajectoryStep]` 
+- `reward: float | None`
+- `timing: RolloutTiming | None`
+- `metrics: dict[str, float] | None`
+
+And `RolloutTiming` (lines 88-93) already tracks timing information!
+
+So instead of creating a separate `GroupProgress` / `TrajectoryProgress` abstraction, we should just **add the progress tracking fields directly to `State`**!
+
+The `State` is:
+1. Created per trajectory
+2. Passed around during rollout
+3. Contains all the trajectory data
+4. Already has timing fields
+
+We could add:
+```python
+class State(dict):
+    # ... existing fields ...
+    # Progress tracking (optional)
+    progress_status: str | None  # "pending", "in_progress", "sampled", "completed"
+    training_status: str | None  # "pending", "enqueued", "done"
+    tokens_generated: int | None
+```
+
+Or even simpler - extend `RolloutTiming` to include what we need:
+```python
+class RolloutTiming(TypedDict, total=False):
+    start_time: float
+    generation_ms: float
+    scoring_ms: float
+    total_ms: float
+    # New fields for progress tracking
+    enqueued_time: float
+    fwd_bwd_done_time: float
+```
+
+Then the watcher just reads from the `State` objects directly. No separate tracker, no IDs, no registry.
+
+The flow becomes:
+1. `State` is created during `run_rollout` in verifiers
+2. Progress fields are populated as the rollout progresses
+3. After scoring, `state["reward"]` is set (already happens)
+4. The ProgressWriter just iterates over active `State` objects and writes JSON
+
+
+5. This approach is cleaner since `State` already contains trajectory data, timing information, and reward values—making it the natural home for status tracking without introducing unnecessary abstractions or separate registries.
+
+[ASSISTANT]
+`State` (lines 95-136) is the object that already tracks per-trajectory data:
+- `trajectory: list[TrajectoryStep]`
+- `reward: float | None`
+- `timing: RolloutTiming | None` (lines 88-93 - already has `start_time`, `generation_ms`, etc.)
+- `metrics: dict[str, float] | None`
+
+**The progress tracking should just be additional fields on `State`:**
+
+```python
+class RolloutTiming(TypedDict, total=False):
+    start_time: float
+    generation_ms: float
+    scoring_ms: float
+    total_ms: float
+    # Add these:
+    enqueued_time: float      # when forward_backward was called
+    fwd_bwd_done_time: float  # when forward_backward completed
+
+class State(dict):
+    # ... existing ...
+    timing: RolloutTiming | None
+    # Add:
+    progress_status: Literal["pending", "in_progress", "sampled", "completed"] | None
+    training_status: Literal["pending", "enqueued", "done"] | None
+    tokens_generated: int | None
+```
+
+**Usage becomes trivial:**
+
+```python
+# In run_rollout_with_context:
+state["progress_status"] = "in_progress"
+state["tokens_generated"] = context_length
+
+# After sampling completes:
+state["progress_status"] = "sampled"
+
+# After scoring:
+state["progress_status"] = "completed"  # reward already set by verifiers
+
+# During training:
+state["training_status"] = "enqueued"
+state["timing"]["enqueued_time"] = time.time()
+```
+
+**The "tracker" becomes just a writer that reads from `states`:**
+
+```python
+def write_progress(states: list[State]):
+    data = [{"status": s.get("progress_status"), "reward": s.get("reward"), ...} for s in states]
+    PROGRESS_FILE.write_text(json.dumps(data))
+```
+
+No separate data structure. The state *is* the progress.
+
+[USER]
+no, we cannot change /home/ohadr/verifiers/verifiers/types.py
+what was the best abstraction so far? 
+
+[THINKING]
+The user is saying we can't modify the verifiers library. So we need to work within the tinker-cookbook codebase.
+
+Looking back at the conversation, the best abstraction we discussed was adding `progress: GroupProgress | None` directly to `VerifiersEnvGroupBuilder` (or the base `EnvGroupBuilder`), since:
+
+1. `VerifiersEnvGroupBuilder` persists through the entire rollout
+2. It's available in `custom_do_group_rollout` where all the tracking happens
+3. It has access to all trajectories via `traj_idx`
+4. No monkeypatching needed - just a proper attribute
+5. No IDs, no registry, no context vars
+
+The GroupProgress dataclass would hold the per-trajectory state, and a simple writer would serialize it to JSON.
+
+[ASSISTANT]
+Adding `progress: GroupProgress | None` to `VerifiersEnvGroupBuilder` (or base `EnvGroupBuilder`):
+
+```python
+# tinker_cookbook/rl/types.py or verifiers_env.py
+@dataclass
+class TrajectoryProgress:
+    status: str = "pending"  # pending, in_progress, sampled, completed
+    training_status: str = "pending"  # pending, enqueued, done
+    tokens: int = 0
+    reward: float | None = None
+    start_time: float | None = None
+    end_time: float | None = None
+
+@dataclass
+class GroupProgress:
+    trajectories: list[TrajectoryProgress]
+    start_time: float = field(default_factory=time.time)
+
+class VerifiersEnvGroupBuilder(EnvGroupBuilder):
+    def __init__(self, ...):
+        # ... existing ...
+        self.progress: GroupProgress | None = None
+```
+
+**Usage in train.py:**
+```python
+vf_builder.progress = GroupProgress([TrajectoryProgress() for _ in range(group_size)])
+
+# Inside run_rollout_with_context:
+vf_builder.progress.trajectories[traj_idx].status = "in_progress"
+vf_builder.progress.trajectories[traj_idx].tokens = token_counts["total_tokens"]
+
+# After scoring:
+for i, reward in enumerate(rewards):
+    vf_builder.progress.trajectories[i].reward = reward
+    vf_builder.progress.trajectories[i].status = "completed"
+```
+
+**Writer just collects builders:**
+```python
+def write_progress(builders: list[EnvGroupBuilder]):
+    groups = {i: b.progress for i, b in enumerate(builders) if b.progress}
+    PROGRESS_FILE.write_text(json.dumps(...))
+```
+
+No IDs, no registry, no context vars, no monkeypatching.
+
+[USER]
+ok, give a plan to implement
+
+[THINKING]
+The user wants me to create a plan for implementing the simpler progress tracking abstraction we discussed. Let me summarize what we've established:
+
+1. The current `TrajectoryProgressTracker` is overly complex with:
+   - Singleton pattern
+   - ID allocation and registry lookups
+   - Monkeypatching `_progress_group_id` onto builders
+   - Context vars to pass group_id/traj_idx through call stacks
+   - Mixed concerns (tracking + 700 lines of display code)
+
+2. The better abstraction is:
+   - Add `progress: GroupProgress | None` directly to `VerifiersEnvGroupBuilder` (or base `EnvGroupBuilder`)
+   - `GroupProgress` contains `list[TrajectoryProgress]`
+   - State lives on the object it describes
+   - Writer just collects builders with non-None progress
+
+3. Key files involved:
+   - `tinker_cookbook/recipes/verifiers_rl/verifiers_env.py` - where `VerifiersEnvGroupBuilder` is defined
+   - `tinker_cookbook/recipes/verifiers_rl/train.py` - where tracking calls are (commented out)
+   - `tinker_cookbook/recipes/verifiers_rl/tinker_openai.py` - where LLM call tracking happens (commented out)
+   - `tinker_cookbook/utils/trajectory_progress.py` - current tracker implementation
+   - `tinker_cookbook/rl/types.py` - base `EnvGroupBuilder` class
+
+Let me also check if there are other files I need to understand. The patch file showed changes to `tinker_cookbook/rl/train.py` as well.
+
+I should create a plan file and potentially launch an Explore agent to understand the base `EnvGroupBuilder` class and how it's used across the codebase.
+
+Actually, I have a pretty good understanding from the conversation already. Let me:
+
+
+1. Read the base `EnvGroupBuilder` to see if I should add `progress` there or just to `VerifiersEnvGroupBuilder`
+2. Create the plan
+
+Let me read the base class first.
+
+[ASSISTANT]
+Let me first check the base `EnvGroupBuilder` class to decide where to add the `progress` attribute.
+
+[THINKING]
+Now I have a complete picture. The `EnvGroupBuilder` (line 64-107) is an abstract base class. The `VerifiersEnvGroupBuilder` extends it.
+
+I can now create a plan. The key points:
+
+1. Add `progress: GroupProgress | None = None` to `VerifiersEnvGroupBuilder` (not the base class, since this is specific to verifiers RL recipe)
+
+2. Create simple dataclasses `TrajectoryProgress` and `GroupProgress` - these can live in a new file or in `trajectory_progress.py` (simplified)
+
+3. Update `train.py` to:
+   - Create `GroupProgress` when starting rollout
+   - Update progress during rollout
+   - Update training status during training
+
+4. Update `tinker_openai.py` to update tokens on each LLM call (or pass through the builder)
+
+5. Simplify `trajectory_progress.py`:
+   - Keep the display/watch code
+   - Remove the singleton tracker, ID allocation, registry
+   - Add a simple `write_progress(builders)` function
+
+Let me write this plan.
+
+[ASSISTANT]
+Now I have a complete picture. Let me write the plan.
+
+[THINKING]
+I've written a comprehensive plan. Let me ask the user if there's anything they want to clarify, particularly:
+
+1. Option A vs Option B for tinker_openai.py - should we pass progress through or update tokens in train.py?
+2. Whether to keep the display code in the same file or split it out
+3. Whether the writer should be called automatically or manually
+
+Actually, looking at the plan, I think Option B (update tokens in train.py after `run_rollout_with_context` returns) is simpler and I should just recommend that.
+
+Let me use ExitPlanMode since the plan is complete and clear.
+
+[THINKING]
+The user wants to keep a minimal `get_trajectory_context` - so instead of removing all context vars, they want to keep a simple mechanism to get the current trajectory progress so tinker_openai.py can update it.
+
+Let me update the plan to reflect this.
+
+[ASSISTANT]
+Got it - keep a minimal context mechanism. Let me update the plan.
+
+[THINKING]
+Good, I've updated the plan. Now let me also update the "New Data Structures" section to include the minimal context var mechanism.
+
+[THINKING]
+Now let me update the "New Data Structures" section to show the minimal context var.
+
+[THINKING]
+Now let me update the usage section to show how to use set_trajectory_progress.
+
+[THINKING]
+The plan is now complete with all the details. Let me also update the train.py changes section to mention removing the old context var imports and adding the new ones.
+
+[THINKING]
+The plan is now complete. Let me call ExitPlanMode to get user approval.
+
+[THINKING]
+The user is asking if we're utilizing the verifiers types.py enough. Earlier they said we can't modify it, but maybe they're suggesting we should use the existing types there more. Let me think about this.
+
+Looking at `/home/ohadr/verifiers/verifiers/types.py`:
+- `State` (lines 95-136) has `timing: RolloutTiming | None`
+- `RolloutTiming` (lines 88-93) has `start_time`, `generation_ms`, `scoring_ms`, `total_ms`
+
+The `State` object is already being passed around during rollout and contains per-trajectory data. Maybe instead of creating a separate `TrajectoryProgress` dataclass, we could leverage the fact that `State` already exists and is accessible.
+
+Looking back at the code:
+- In `train.py`, `run_rollout_with_context` returns `result` which is a `vf.State`
+- The `states` list collects all the `State` objects from the rollouts
+
+So maybe the user is suggesting:
+1. Instead of `GroupProgress` with `list[TrajectoryProgress]`, we could just work with `list[State]` directly
+2. The progress status could be inferred from the State's fields
+3. We could add a thin wrapper or just use the State objects directly for the display
+
+But wait - the user said we can't modify verifiers/types.py. So we can't add new fields to `State` or `RolloutTiming`.
+
+However, we could:
+1. Use the existing `State.timing` for timing info
+2. Use `State.reward` for reward
+3. Infer status from what's populated in the State
+4. Store the `states` list on the builder and use that for progress display
+
+Let me re-read verifiers_env.py to see how states are used...
+
+Actually, the issue is that `State` objects are created during rollout and don't exist before. 
+
+The problem is we can't track pending trajectories using `State` objects since they only exist after rollout completes. We might need to keep `GroupProgress` for tracking pending and in-progress items, then reference the actual `State` objects once they're available. Or we could have `GroupProgress.trajectories` store references to `State` objects as they become available during execution.
+
+[ASSISTANT]
+Good question. Let me re-examine how we could leverage the existing `State` type from verifiers.
+
+Looking at `State` (lines 95-136 in verifiers/types.py):
+- Already has `timing: RolloutTiming | None` with `start_time`, `generation_ms`, etc.
+- Already has `reward: float | None`
+- Already has `trajectory: list[TrajectoryStep]` (can count tokens from this)
+
+The issue is `State` objects are created during rollout - they don't exist for "pending" trajectories.
+
+[THINKING]
+Ah, the user wants to simplify even further. Instead of passing around the `TrajectoryProgress` object through context vars, we could just have context functions that directly update a counter:
+
+- `set_trajectory_context(prompt_tokens)` - called in tinker_openai.py after building the prompt
+- `set_trajectory_sampled(total_tokens)` - called in train.py after sampling completes
+
+This is much simpler - no object passing, just values. The question is where these values get stored. They'd still need to update something on the builder or in a shared structure.
+
+Let me think about this more carefully. The user seems to want:
+1. Simple functions that update progress
+2. Use the existing State/verifiers types where possible
+
+Maybe the flow is:
+1. `vf_builder.progress` is still a `GroupProgress` with `list[TrajectoryProgress]`
+2. Context var holds `TrajectoryProgress | None` (as in current plan)
+3. `set_trajectory_context(tokens)` updates `current_traj.tokens = tokens`
+4. `set_trajectory_sampled(total_tokens)` updates `current_traj.tokens = total_tokens; current_traj.status = SAMPLED`
+
+Actually wait - the user's suggestion is even simpler. They're suggesting:
+- `set_trajectory_context(len(prompt_token_ids))` - sets context length
+- `set_trajectory_sampled(token_counts["total_tokens"])` - marks as sampled with final token count
+
+These functions would update whatever tracking structure exists. The naming implies they're just setting values, not passing objects.
+
+Let me update the plan to reflect this simpler API.
+
+[ASSISTANT]
+Much simpler! Just functions that set values. Let me update the plan.
+
+[THINKING]
+Now let me update the tinker_openai.py section and the usage section to reflect this simpler API.
+
+[THINKING]
+Now update the usage example in the plan to reflect the simpler API.
+
+[THINKING]
+Wait, there's an issue - `set_trajectory_sampled` is called after `set_current_trajectory(None)` in the finally block. I need to fix the order. The sampled call should happen before clearing the context.
+
+Actually looking at it more carefully - the `finally` block runs before `set_trajectory_sampled`. Let me fix this so the order makes sense.
+
+[THINKING]
+Good, now the plan is updated. Also need to update the train.py changes section to mention the new imports.
+
+[THINKING]
+Let me read the plan to make sure it looks coherent now.
+
+[THINKING]
+The plan looks good. Let me call ExitPlanMode to get user approval.
+
+[ASSISTANT]
+The plan is complete and coherent. Key points:
+
+1. **State lives on the object** - `VerifiersEnvGroupBuilder.progress: GroupProgress | None`
+2. **Simple context API** - `set_current_trajectory(traj)`, `set_trajectory_context(tokens)`, `set_trajectory_sampled(total_tokens)`
+3. **No singleton/registry** - just dataclasses and a `write_progress(builders)` function
+4. **Keep display code** - the watcher stays, just reads from the new format
+
+[THINKING]
+The user wants me to read the current `tinker_cookbook/rl/train.py` (not the patch) and ask more questions. Let me do that.
+
+[THINKING]
+Now I see the full context. This is the base `tinker_cookbook/rl/train.py` which is different from the `recipes/verifiers_rl/train.py`. 
+
+Looking at the current code:
+1. The base `rl/train.py` has no progress tracking at all - it's the clean version
+2. The `recipes/verifiers_rl/train.py` (which I read earlier) has commented-out tracker code
+3. The patch file shows changes to `rl/train.py` that add progress tracking
+
+The user is asking me to consider the full picture. Some questions I should ask:
+
+1. Should progress tracking be in the base `rl/train.py` or only in `recipes/verifiers_rl/train.py`?
+2. The patch shows adding progress to `rl/train.py`, but the current plan focuses on `recipes/verifiers_rl/`. Which approach?
+3. How should the `write_progress` function be called? Periodically? On every state change?
+4. Should training_status tracking happen in `rl/train.py` (the base) or in `recipes/verifiers_rl/train.py`?
+
+Let me ask these questions.
+
+[ASSISTANT]
+Now I see the full picture. The base `rl/train.py` has no progress tracking - it's clean. The patch (from `tinker-self-hosting`) adds tracking to this file, while `recipes/verifiers_rl/train.py` has commented-out tracker code.
+
+[THINKING]
+The user wants:
+1. "everything" - tracking in both base rl/train.py AND recipes/verifiers_rl/train.py
+2. "like before" - write on every state change (how the current tracker works with `_write_state()` after each update)
+
+Let me update the plan to reflect this expanded scope. The plan now needs to cover:
+
+1. `trajectory_progress.py` - simplify the tracker, keep write-on-change
+2. `rl/types.py` - add `progress: GroupProgress | None` to base `EnvGroupBuilder`
+3. `rl/train.py` - add progress tracking to all training modes (sync, async, streaming)
+4. `recipes/verifiers_rl/verifiers_env.py` - inherits from EnvGroupBuilder, so gets progress automatically
+5. `recipes/verifiers_rl/train.py` - update to use new API
+6. `recipes/verifiers_rl/tinker_openai.py` - update to use set_trajectory_context
+
+Let me update the plan file significantly.
+
+[ASSISTANT]
+Got it - tracking in base `rl/train.py` (all modes) with write-on-change behavior. Let me update the plan.
+
+[THINKING]
+The user wants me to ask additional questions. Let me think about what else needs to be clarified:
+
+1. The `EnvGroupBuilder` is an ABC - can we add an instance attribute to it? We might need to use `__init__` or handle this differently.
+
+2. Where exactly should `unregister_group` be called? After forward_backward completes? After optim_step?
+
+3. Should we keep the `_write_state()` call inside the lock or outside? (Current plan has it outside which could have race conditions)
+
+4. The display code (`watch()`) expects certain JSON structure - need to make sure new `to_dict()` produces compatible output
+
+5. What about the `num_workers` field that the current tracker tracks? Should we keep that?
+
+Let me ask these questions.
+
+[THINKING]
+The user wants to defer the ABC attribute question and the unregister timing. Let me update the plan to mark these as "TBD" and ask if there are any other questions or if we should proceed.
+
+[THINKING]
+Now let me also update the plan to note that cleanup timing is TBD. And then ask if there are more questions or if I should proceed.
+
+[THINKING]
+Let me ask one more clarifying question about the display code compatibility, then I can proceed with ExitPlanMode.
+
+[THINKING]
+Good, we'll keep the JSON format compatible. Let me update the plan and then call ExitPlanMode.
+
+[THINKING]
+Good, now let me call ExitPlanMode to get user approval for the plan.
+
+
+
+# Plan: Simplify Progress Tracking Abstraction
+
+## Goal
+Replace the complex `TrajectoryProgressTracker` (singleton, ID registry, context vars, monkeypatching) with a simpler design where progress state lives directly on `EnvGroupBuilder`.
+
+## Current Problems
+- Monkeypatching `_progress_group_id` onto builders
+- ID allocation and registry lookups in singleton
+- Context vars passing IDs through call stack
+- Scattered lifecycle management
+- 900-line file mixing tracking with display code
+
+## New Design
+Progress state lives on the object it describes:
+```
+EnvGroupBuilder.progress: GroupProgress | None
+  └── trajectories: list[TrajectoryProgress]
+        └── status, training_status, tokens, reward, timing...
+```
+
+Write-on-change: Each state update writes to JSON (like current `_write_state()`).
+
+---
+
+## Files to Modify
+
+### 1. `tinker_cookbook/utils/trajectory_progress.py`
+**Keep:**
+- `TrajectoryStatus` enum (line 34)
+- Display code (`watch()`, `RollingStats`, etc.) - lines 292-940
+
+**Remove:**
+- `TrajectoryProgressTracker` class (lines 91-276)
+- `GroupState` class (use new `GroupProgress`)
+- Old context var functions
+
+**Add/Simplify:**
+```python
+@dataclass
+class TrajectoryProgress:
+    status: TrajectoryStatus = TrajectoryStatus.PENDING
+    training_status: str = "pending"  # "pending" | "enqueued" | "done"
+    tokens: int = 0  # maps to "tokens_generated" in JSON
+    reward: float | None = None
+    start_time: float | None = None
+    end_time: float | None = None
+    enqueued_time: float | None = None
+    fwd_bwd_done_time: float | None = None
+
+    def to_dict(self) -> dict:
+        # Match existing JSON format for watch() compatibility
+        return {
+            "status": self.status.value,
+            "training_status": self.training_status,
+            "tokens_generated": self.tokens,
+            "reward": self.reward,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "enqueued_time": self.enqueued_time,
+            "fwd_bwd_done_time": self.fwd_bwd_done_time,
+        }
+
+@dataclass
+class GroupProgress:
+    group_id: int
+    trajectories: list[TrajectoryProgress]
+    start_time: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict: ...
+
+# Global registry of active groups (for write_progress)
+_active_groups: dict[int, GroupProgress] = {}
+_write_lock = threading.Lock()
+_next_group_id: int = 0
+
+def register_group(progress: GroupProgress) -> None:
+    with _write_lock:
+        _active_groups[progress.group_id] = progress
+    _write_progress()
+
+def unregister_group(group_id: int) -> None:
+    with _write_lock:
+        _active_groups.pop(group_id, None)
+    _write_progress()
+
+def allocate_group_id() -> int:
+    global _next_group_id
+    with _write_lock:
+        gid = _next_group_id
+        _next_group_id += 1
+    return gid
+
+def _write_progress() -> None:
+    """Write current state to JSON file."""
+    with _write_lock:
+        state = {
+            "timestamp": time.time(),
+            "groups": {gid: g.to_dict() for gid, g in _active_groups.items()},
+        }
+    PROGRESS_FILE.write_text(json.dumps(state))
+
+# Minimal context var for tinker_openai.py
+_current_trajectory: ContextVar[TrajectoryProgress | None] = ContextVar("traj", default=None)
+
+def set_current_trajectory(progress: TrajectoryProgress | None) -> None:
+    _current_trajectory.set(progress)
+
+def set_trajectory_context(prompt_tokens: int) -> None:
+    """Update current trajectory's token count (called in tinker_openai.py)."""
+    traj = _current_trajectory.get()
+    if traj is not None:
+        traj.tokens = prompt_tokens
+        _write_progress()
+
+def set_trajectory_sampled(total_tokens: int) -> None:
+    """Mark current trajectory as sampled (called in train.py after rollout)."""
+    traj = _current_trajectory.get()
+    if traj is not None:
+        traj.tokens = total_tokens
+        traj.status = TrajectoryStatus.SAMPLED
+        traj.end_time = time.time()
+        _write_progress()
+```
+
+### 2. `tinker_cookbook/rl/types.py`
+**TBD:** How to add `progress: GroupProgress | None` to the ABC. Options:
+- Class attribute with None default
+- Add `__init__` to ABC
+- Protocol/mixin approach
+
+Will decide during implementation.
+
+### 3. `tinker_cookbook/rl/train.py`
+**Add imports:**
+```python
+from tinker_cookbook.utils.trajectory_progress import (
+    GroupProgress,
+    TrajectoryProgress,
+    TrajectoryStatus,
+    register_group,
+    unregister_group,
+    allocate_group_id,
+    set_current_trajectory,
+    set_trajectory_sampled,
+)
+```
+
+**Modify `do_group_rollout_and_filter_constant_reward` (line 669-687):**
+- Before rollout: create and register `GroupProgress`
+- After rollout: update statuses, unregister on completion
+
+**Modify `trajectory_group_worker_task` in sync mode (line 369-394):**
+- Initialize progress on builder before rollout
+- Update status during/after rollout
+
+**Modify `trajectory_group_worker_loop` in async mode (line 498-530):**
+- Same pattern: init progress, update status, cleanup
+
+**Modify `do_train_step_streaming_and_get_sampling_client` (line 793-912):**
+- Mark `training_status = "enqueued"` when calling forward_backward
+- Mark `training_status = "done"` when result consumed
+
+### 4. `tinker_cookbook/recipes/verifiers_rl/verifiers_env.py`
+**No changes needed** - `VerifiersEnvGroupBuilder` inherits from `EnvGroupBuilder`, so it gets `progress` attribute automatically.
+
+### 5. `tinker_cookbook/recipes/verifiers_rl/train.py`
+**Update imports (line 26-30):**
+```python
+from tinker_cookbook.utils.trajectory_progress import (
+    GroupProgress,
+    TrajectoryProgress,
+    TrajectoryStatus,
+    set_current_trajectory,
+    set_trajectory_sampled,
+    allocate_group_id,
+    register_group,
+    unregister_group,
+)
+```
+
+**Update `custom_do_group_rollout` (line 147-226):**
+```python
+async def custom_do_group_rollout(builder: EnvGroupBuilder, policy: TokenCompleter) -> TrajectoryGroup:
+    vf_builder = cast(VerifiersEnvGroupBuilder, builder)
+
+    # Initialize progress
+    group_id = allocate_group_id()
+    vf_builder.progress = GroupProgress(
+        group_id=group_id,
+        trajectories=[TrajectoryProgress() for _ in range(cli_config.group_size)]
+    )
+    register_group(vf_builder.progress)
+
+    async def run_rollout_with_context(traj_idx: int, rollout_input):
+        traj_progress = vf_builder.progress.trajectories[traj_idx]
+        traj_progress.status = TrajectoryStatus.IN_PROGRESS
+        traj_progress.start_time = time.time()
+
+        set_current_trajectory(traj_progress)
+        try:
+            result = await vf_builder.vf_env.run_rollout(...)
+            token_counts = extract_num_tokens_from_state(result)
+            set_trajectory_sampled(token_counts["total_tokens"])
+            return result
+        finally:
+            set_current_trajectory(None)
+
+    states = await asyncio.gather(*[...])
+    await vf_builder.vf_env.rubric.score_group(states, ...)
+
+    # Mark completed with rewards
+    for i, state in enumerate(states):
+        vf_builder.progress.trajectories[i].reward = state.get("reward") or 0.0
+        vf_builder.progress.trajectories[i].status = TrajectoryStatus.COMPLETED
+
+    # TBD: When to call unregister_group - defer decision for implementation
+    return convert_states_to_trajectory_group(states)
+```
+
+### 6. `tinker_cookbook/recipes/verifiers_rl/tinker_openai.py`
+**Update imports (line 35-38):**
+```python
+from tinker_cookbook.utils.trajectory_progress import set_trajectory_context
+```
+
+**Update line 196 (inside `create` method):**
+```python
+context_length = len(prompt_token_ids)
+set_trajectory_context(context_length)
+```
+
+---
+
+## Verification
+
+1. **Unit test:** Create `GroupProgress`, update trajectories, verify `to_dict()` and JSON output
+2. **Integration test:** Run verifiers RL training, verify `/tmp/trajectory_progress.json` updates
+3. **Display test:** Run watcher while training, verify dashboard updates correctly
+4. **All modes:** Test sync, async, and streaming minibatch modes
+
+---
+
+## Migration Notes
+- Old `TrajectoryProgressTracker.get_instance()` calls → use new functions directly
+- Old `tracker.track_llm_call(gid, tokens, idx)` → `set_trajectory_context(tokens)`
+- Old `tracker.complete_group(gid, rewards)` → update `progress.trajectories[i].reward` directly
+- Old `tracker.remove_group(gid)` → `unregister_group(gid)`

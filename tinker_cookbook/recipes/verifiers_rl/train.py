@@ -175,8 +175,6 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         gen_sem = shared_gen_sem
         score_sem = shared_score_sem
 
-        # group_id: int = builder._progress_group_id
-        # tracker = TrajectoryProgressTracker.get_instance()
 
         gen_sampling_args = {
             "max_tokens": cli_config.max_tokens,
@@ -208,10 +206,10 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                         )
                         return result
                     token_counts = extract_num_tokens_from_state(result)
-                    # tracker.mark_trajectory_sampled(group_id, traj_idx, token_counts["total_tokens"])
                     return result
             finally:
-                clear_trajectory_context()
+                pass
+                # clear_trajectory_context()
 
         states = list(await asyncio.gather(*[
             run_rollout_with_context(i, inp)
@@ -236,13 +234,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         dataset_seed=cli_config.dataset_seed,
     )
 
-    # tracker = TrajectoryProgressTracker.get_instance()
-    # tracker.configure(
-    #     max_tokens=65536,
-    #     group_size=cli_config.group_size,
-    #     enabled=True,
-    #     refresh_rate=4.0,
-    # )
+
 
     loss_fn_config: dict[str, float] | None = None
     if cli_config.clip_low_threshold is not None or cli_config.clip_high_threshold is not None:

@@ -2,14 +2,19 @@
 Basic interfaces and types for reinforcement learning.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Sequence, TypeAlias
+from typing import TYPE_CHECKING, Sequence, TypeAlias
 
 import chz
 import tinker
 from tinker_cookbook.completers import StopCondition, TokensWithLogprobs
 from tinker_cookbook.utils.misc_utils import safezip
+
+if TYPE_CHECKING:
+    from tinker_cookbook.utils.trajectory_progress import GroupProgress
 
 Action: TypeAlias = list[int]
 Observation: TypeAlias = tinker.ModelInput
@@ -78,6 +83,8 @@ class EnvGroupBuilder(ABC):
     - To define a multi-agent environment
     - As a part of the *algorithm* (e.g. GRPO), when dealing with single-agent tasks.
     """
+
+    progress: GroupProgress | None = None
 
     @abstractmethod
     async def make_envs(self) -> Sequence[Env]:

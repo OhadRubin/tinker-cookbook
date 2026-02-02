@@ -24,9 +24,11 @@ from tinker_cookbook.rl import train
 from tinker_cookbook.rl.types import EnvGroupBuilder, TrajectoryGroup
 from tinker_cookbook.tokenizer_utils import Tokenizer, get_tokenizer
 from tinker_cookbook.utils.trajectory_progress import (
-    TrajectoryProgressTracker,
-    set_trajectory_context,
-    clear_trajectory_context,
+    GroupProgress,
+    enable_tracking,
+    set_trajectory_in_progress,
+    set_trajectory_sampled,
+    set_trajectory_completed,
 )
 
 
@@ -133,6 +135,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
     log_path = cli_config.log_path or f"/tmp/tinker-examples/verifiers_rl/{run_name}"
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)
 
+    enable_tracking(cli_config.group_size, cli_config.groups_per_batch)
+
     env_args = json.loads(cli_config.vf_env_args) if cli_config.vf_env_args else {}
     if cli_config.system_prompt_path:
         with open(cli_config.system_prompt_path) as f:
@@ -181,9 +185,12 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
             "temperature": cli_config.temperature,
         }
 
+        progress = GroupProgress.create(cli_config.group_size)
+        builder.progress = progress
+
         async def run_rollout_with_context(traj_idx: int, rollout_input, max_retries: int = 30):
-            # set_trajectory_context(group_id, traj_idx)
-            try:
+            with progress.trajectories[traj_idx].context():
+                set_trajectory_in_progress()
                 result: vf.State | None = None
                 backoff_seconds = 1
                 for attempt in range(max_retries):
@@ -192,35 +199,38 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                     )
                     error = result.get("error", None)
                     if isinstance(error, vf.Error):
-                        # TODO: we will consider adding a feature that would check if a lot of trajectories failed and pause everything
+                          # TODO: we will consider adding a feature that would check if a lot of trajectories failed and pause everything
                         # or a feature that would reset backoff_seconds according to a switch i could toggle via a file?
                         log.error("run_rollout_with_context attempt failed", component="verifiers_rl", content=str(error),
-                        #  group_id=group_id, traj_idx=traj_idx,
+                          group_id=progress.group_id, traj_idx=traj_idx,
                           attempt=attempt, backoff_seconds=backoff_seconds)
                         if attempt < max_retries - 1:
                             await asyncio.sleep(backoff_seconds)
                             backoff_seconds *= 2
                             continue
-                        log.error("all run_rollout_with_context attempts failed", component="verifiers_rl", content=str(error), 
-                        # group_id=group_id, traj_idx=traj_idx
+                        log.error("all run_rollout_with_context attempts failed", component="verifiers_rl", content=str(error),
+                        group_id=progress.group_id, traj_idx=traj_idx
                         )
                         return result
                     token_counts = extract_num_tokens_from_state(result)
+                    set_trajectory_sampled(token_counts.get("total_tokens", 0))
                     return result
-            finally:
-                pass
-                # clear_trajectory_context()
+                return result
 
-        states = list(await asyncio.gather(*[
-            run_rollout_with_context(i, inp)
-            for i, inp in enumerate(rollout_inputs)
-        ]))
+        with progress.context():
+            states = list(await asyncio.gather(*[
+                run_rollout_with_context(i, inp)
+                for i, inp in enumerate(rollout_inputs)
+            ]))
 
-        await vf_builder.vf_env.rubric.score_group(states, score_sem=score_sem)
+            await vf_builder.vf_env.rubric.score_group(states, score_sem=score_sem)
 
-        rewards = [state.get("reward") or 0.0 for state in states]
-        # tracker.complete_group(group_id, rewards)
+            rewards = [state.get("reward") or 0.0 for state in states]
+            for i, reward in enumerate(rewards):
+                with progress.trajectories[i].context():
+                    set_trajectory_completed(reward)
 
+        builder.progress = None
         return convert_states_to_trajectory_group(states)
 
     # override do_group_rollout function inside rl.train

@@ -32,10 +32,7 @@ TIMEOUT_ERROR_PREFIX = "TINKER_TIMEOUT: "
 SAMPLING_TIMEOUT_SECONDS = 180
 SAMPLING_TIMEOUT_INCREMENT = 30
 
-from tinker_cookbook.utils.trajectory_progress import (
-    TrajectoryProgressTracker,
-    get_trajectory_context,
-)
+from tinker_cookbook.utils.trajectory_progress import set_trajectory_context
 from openai._streaming import AsyncStream
 from openai.resources.chat import AsyncChat as OpenAIAsyncChat
 from openai.resources.chat.completions import AsyncCompletions as OpenAIAsyncChatCompletions
@@ -193,7 +190,7 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             logprobs: List[float] = seq.logprobs or [0.0] * len(completion_token_ids)
 
             context_length = len(prompt_token_ids)
-            # TODO: instead, we will do  set_trajectory_context(len(prompt_token_ids))
+            set_trajectory_context(context_length)
 
 
             assistant_message, parse_success = renderer.parse_response(

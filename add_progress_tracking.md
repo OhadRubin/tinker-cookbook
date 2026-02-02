@@ -21,7 +21,6 @@ class TrajectoryProgress:
     status: TrajectoryStatus = TrajectoryStatus.PENDING
     training_status: str = "pending"  # "pending" | "enqueued" | "done"
     tokens_generated: int = 0
-    max_tokens: int = 65536
     reward: float | None = None
     start_time: float | None = None
     end_time: float | None = None

@@ -1,28 +1,19 @@
 """
-Progress tracking for RL trajectory collection.
+Viewer for RL trajectory progress.
 
-Writes state to a JSON file that can be watched by a separate display process.
- export 
-Run `(cd ~/tinker-cookbook && PYTHONPATH="/root/tinker-self-hosting:$PYTHONPATH" uv run python -m tinker_cookbook.utils.viewer)` in another terminal to watch.
- cd ~/tinker-cookbook && PYTHONPATH="$HOME/tinker-self-hosting:$PYTHONPATH" uv run python -m tinker_cookbook.utils.viewer
+Displays real-time progress from the JSON state file written by trajectory_progress.py.
+
+Run in another terminal:
+  cd ~/tinker-cookbook && PYTHONPATH="$HOME/tinker-self-hosting:$PYTHONPATH" uv run --with structlog  python  -m tinker_cookbook.utils.viewer
 """
-
 
 from __future__ import annotations
 
-from observability import log, bootstrap, set_run_id, Events
-
 import json
-import threading
 import time
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
-from enum import Enum
-from pathlib import Path
-from typing import Iterator
 
-PROGRESS_FILE = Path("/tmp/trajectory_progress.json")
+from tinker_cookbook.utils.trajectory_progress import PROGRESS_FILE
 
 # ============================================================================
 # WATCHER - Run in separate terminal: uv run python -m tinker_cookbook.utils.viewer

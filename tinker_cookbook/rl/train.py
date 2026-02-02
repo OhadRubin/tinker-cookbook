@@ -42,10 +42,34 @@ from tinker_cookbook.tokenizer_utils import Tokenizer
 from tinker_cookbook.utils import logtree, ml_log
 from tinker_cookbook.utils.misc_utils import safezip, split_list, timed, all_same
 from tinker_cookbook.utils.trace import scope, update_scope_context, trace_init
+from tinker_cookbook.utils.trajectory_progress import (
+    set_trajectory_enqueued,
+    set_trajectory_fwd_bwd_done,
+    set_new_optim_step,
+)
 
 from observability import log, bootstrap, set_run_id, Events
 
 MAX_MINUTES_TO_RUN_GROUP = 30
+
+
+def _mark_trajectories_enqueued(env_group_builders: Sequence[EnvGroupBuilder]) -> None:
+    """Mark all trajectories in the builders as enqueued for training."""
+    for builder in env_group_builders:
+        if builder.progress is not None:
+            for traj in builder.progress.trajectories:
+                with traj.context():
+                    set_trajectory_enqueued()
+
+
+def _mark_trajectories_fwd_bwd_done(env_group_builders: Sequence[EnvGroupBuilder]) -> None:
+    """Mark all trajectories in the builders as having completed forward_backward."""
+    for builder in env_group_builders:
+        if builder.progress is not None:
+            for traj in builder.progress.trajectories:
+                with traj.context():
+                    set_trajectory_fwd_bwd_done()
+
 
 def _get_evaluator_name(evaluator: SamplingClientEvaluator) -> str:
     return (
@@ -860,12 +884,15 @@ async def do_train_step_streaming_and_get_sampling_client(
             metrics.update(prepare_minibatch_metrics)
 
             # Enqueue forward-backward (we'll await results after all minibatches are enqueued)
+            minibatch_builders = [g.env_group_builder for g in wrapped_trajectory_groups]
+            _mark_trajectories_enqueued(minibatch_builders)
             with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_enqueue", metrics):
-                forward_backward_futures.append(
+                forward_backward_futures.append((
                     await training_client.forward_backward_async(
                         [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
-                    )
-                )
+                    ),
+                    minibatch_builders,  # track builders for this future
+                ))
             all_data_D.extend(data_D)
             all_wrapped_trajectory_groups.extend(wrapped_trajectory_groups)
             i_minibatch += 1
@@ -879,13 +906,15 @@ async def do_train_step_streaming_and_get_sampling_client(
             optim_future = await training_client.optim_step_async(adam_params)
 
         # Now consume all forward-backward results
-        for i_mb, fwd_bwd_future in enumerate(forward_backward_futures):
+        for i_mb, (fwd_bwd_future, minibatch_builders) in enumerate(forward_backward_futures):
             with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume", metrics):
                 fwd_bwd_result = await fwd_bwd_future.result_async()
                 all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
+                _mark_trajectories_fwd_bwd_done(minibatch_builders)
 
         with timed(f"train/optim_substep_{i_substep}_consume", metrics):
             await optim_future.result_async()
+            set_new_optim_step()
 
     # Aggregate metrics across the entire batch
     metrics.update(compute_sampling_client_metrics(all_wrapped_trajectory_groups))
@@ -936,6 +965,7 @@ async def do_train_step_and_get_sampling_client(
     )
     metrics.update(prepare_minibatch_metrics)
 
+    _mark_trajectories_enqueued(env_group_builders_P)
     with timed("train", metrics):
         training_logprobs_D = await train_step(
             data_D,
@@ -945,6 +975,8 @@ async def do_train_step_and_get_sampling_client(
             cfg.loss_fn,
             cfg.loss_fn_config,
         )
+    _mark_trajectories_fwd_bwd_done(env_group_builders_P)
+    set_new_optim_step()
 
     sampling_client, full_batch_metrics = await compute_full_batch_metrics_and_get_sampling_client(
         training_client,

@@ -206,7 +206,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                           attempt=attempt, backoff_seconds=backoff_seconds)
                         if attempt < max_retries - 1:
                             await asyncio.sleep(backoff_seconds)
-                            backoff_seconds *= 2
+                            backoff_seconds *= 1.1
                             continue
                         log.error("all run_rollout_with_context attempts failed", component="verifiers_rl", content=str(error),
                         group_id=progress.group_id, traj_idx=traj_idx
@@ -230,7 +230,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                 with progress.trajectories[i].context():
                     set_trajectory_completed(reward)
 
-        builder.progress = None
+        # Note: builder.progress is NOT cleared here - it persists through training
+        # and is cleaned up by set_new_optim_step() after training completes
         return convert_states_to_trajectory_group(states)
 
     # override do_group_rollout function inside rl.train

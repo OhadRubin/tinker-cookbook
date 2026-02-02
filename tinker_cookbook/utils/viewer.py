@@ -160,9 +160,15 @@ def watch(capture_file: str | None):
             if group.get("end_time"):
                 group_completion_times.append(group["end_time"])
 
-            # Track per-group training status and rewards
-            group_enqueued_count = 0
-            group_done_count = 0
+            # Training status is now per-group (not per-trajectory)
+            group_training_status = group.get("training_status", "pending")
+            if group_training_status == "enqueued":
+                enqueued_groups += 1
+                training_enqueued += len(trajectories)  # count trajectories for backwards compat
+            elif group_training_status == "done":
+                done_groups += 1
+                training_done += len(trajectories)
+
             group_rewards: list[float] = []
 
             for tid, traj in trajectories.items():
@@ -177,21 +183,6 @@ def watch(capture_file: str | None):
                     if reward is not None:
                         all_rewards.append(reward)
                         group_rewards.append(reward)
-
-                ts = traj.get("training_status", "pending")
-                if ts == "enqueued":
-                    training_enqueued += 1
-                    group_enqueued_count += 1
-                elif ts == "done":
-                    training_done += 1
-                    group_done_count += 1
-
-            # Classify groups
-            num_trajs = len(trajectories) if trajectories else group_size
-            if group_done_count == num_trajs and num_trajs > 0:
-                done_groups += 1
-            elif group_enqueued_count > 0:
-                enqueued_groups += 1
 
             # Compute within-group reward variance
             if len(group_rewards) >= 2:
@@ -458,11 +449,9 @@ def watch(capture_file: str | None):
             top3_threshold = group_data[gid]["top3_threshold"]
             mean_reward = group_mean_rewards[gid]
 
-            # Check if any trajectory is enqueued
-            has_enqueued = any(
-                trajectories.get(str(t), trajectories.get(t, {})).get("training_status") == "enqueued"
-                for t in range(group_size)
-            )
+            # Training status is now per-group
+            group_training_status = group.get("training_status", "pending")
+            has_enqueued = group_training_status == "enqueued"
 
             row: list[str | Text] = [f"G{int(gid):02d}"]
             completed = 0
@@ -472,7 +461,6 @@ def watch(capture_file: str | None):
                 status = traj.get("status", "pending")
                 tokens = traj.get("tokens_generated", 0)
                 reward = traj.get("reward")
-                training_status = traj.get("training_status", "pending")
                 end_time = traj.get("end_time")
                 last_touched_time = traj.get("last_touched_time")
 
@@ -501,8 +489,8 @@ def watch(capture_file: str | None):
                     rwd_text = Text("   ·", style="dim")
 
                 # Time since last activity (age in seconds)
-                # Hide individual ages when enqueued (all same, shown in Min/Max instead)
-                if has_enqueued or training_status == "done" or status == "sampled":
+                # Hide individual ages when enqueued/done (all same, shown in Min/Max instead)
+                if group_training_status in ("enqueued", "done") or status == "sampled":
                     age_text = Text("  ·", style="dim")
                 elif end_time:
                     age = int(now - end_time)
@@ -513,10 +501,10 @@ def watch(capture_file: str | None):
                 else:
                     age_text = Text("  ·", style="dim")
 
-                # Training status
-                if training_status == "done":
+                # Training status (per-group) combined with sampling status (per-traj)
+                if group_training_status == "done":
                     st_text = Text("D", style="bright_cyan bold")
-                elif training_status == "enqueued":
+                elif group_training_status == "enqueued":
                     st_text = Text("R", style="red bold")
                 elif status == "sampled":
                     st_text = Text("W", style="bright_magenta bold")
@@ -578,23 +566,24 @@ def watch(capture_file: str | None):
         """Feed rolling duration trackers from current state."""
         groups = state.get("groups", {})
         for gid, group in groups.items():
+            # Training timing is now per-group
+            enq_time = group.get("enqueued_time")
+            done_time = group.get("fwd_bwd_done_time")
+
+            if enq_time is not None and done_time is not None:
+                rolling_enq_to_done.add(f"group_{gid}", done_time - enq_time)
+
             trajectories = group.get("trajectories", {})
             for tid, traj in trajectories.items():
                 traj_id = f"{gid}_{tid}"
 
-                # Enqueued → Done (training latency)
-                enq_time = traj.get("enqueued_time")
-                done_time = traj.get("fwd_bwd_done_time")
-                if enq_time is not None and done_time is not None:
-                    rolling_enq_to_done.add(traj_id, done_time - enq_time)
-
-                # Pending → Sampled (sampling latency)
+                # Pending → Sampled (sampling latency, per-trajectory)
                 start_time = traj.get("start_time")
                 end_time = traj.get("end_time")
                 if start_time is not None and end_time is not None:
                     rolling_pend_to_sampled.add(traj_id, end_time - start_time)
 
-                # End-to-end: start_time → fwd_bwd_done_time
+                # End-to-end: traj start_time → group fwd_bwd_done_time
                 if start_time is not None and done_time is not None:
                     rolling_e2e.add(traj_id, done_time - start_time)
 

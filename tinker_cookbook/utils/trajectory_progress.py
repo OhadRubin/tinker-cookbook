@@ -24,10 +24,18 @@ PROGRESS_FILE = Path("/tmp/trajectory_progress.json")
 
 
 class TrajectoryStatus(Enum):
+    """Per-trajectory sampling state."""
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     SAMPLED = "sampled"
     COMPLETED = "completed"
+
+
+class TrainingStatus(Enum):
+    """Per-group training state (training operates on batches of groups)."""
+    PENDING = "pending"      # Waiting (still sampling or awaiting batch)
+    ENQUEUED = "enqueued"    # forward_backward_async called
+    DONE = "done"            # forward_backward result consumed
 
 
 # =============================================================================
@@ -79,20 +87,21 @@ def is_tracking_enabled() -> bool:
 
 @dataclass
 class TrajectoryProgress:
-    """Progress state for a single trajectory."""
+    """Progress state for a single trajectory (sampling only).
+
+    Training state is tracked at the group level since forward_backward
+    operates on batches of groups, not individual trajectories.
+    """
 
     group_id: int
     trajectory_id: int
     status: TrajectoryStatus = TrajectoryStatus.PENDING
-    training_status: str = "pending"  # "pending" | "enqueued" | "done"
     tokens_generated: int = 0
     reward: float | None = None
     start_time: float | None = None
     end_time: float | None = None
     last_touched_time: float | None = None
     num_llm_calls: int = 0
-    enqueued_time: float | None = None
-    fwd_bwd_done_time: float | None = None
 
     @contextmanager
     def context(self) -> Iterator[TrajectoryProgress]:
@@ -109,26 +118,31 @@ class TrajectoryProgress:
             "group_id": self.group_id,
             "trajectory_id": self.trajectory_id,
             "status": self.status.value,
-            "training_status": self.training_status,
             "tokens_generated": self.tokens_generated,
             "reward": self.reward,
             "start_time": self.start_time,
             "end_time": self.end_time,
             "last_touched_time": self.last_touched_time,
             "num_llm_calls": self.num_llm_calls,
-            "enqueued_time": self.enqueued_time,
-            "fwd_bwd_done_time": self.fwd_bwd_done_time,
         }
 
 
 @dataclass
 class GroupProgress:
-    """Progress state for a group of trajectories."""
+    """Progress state for a group of trajectories.
+
+    Training state lives here because forward_backward operates on groups,
+    not individual trajectories.
+    """
 
     group_id: int
     trajectories: list[TrajectoryProgress] = field(default_factory=list)
     start_time: float | None = None
     end_time: float | None = None
+    # Training state (per-group, not per-trajectory)
+    training_status: TrainingStatus = TrainingStatus.PENDING
+    enqueued_time: float | None = None
+    fwd_bwd_done_time: float | None = None
 
     @classmethod
     def create(cls, group_size: int) -> GroupProgress:
@@ -160,6 +174,9 @@ class GroupProgress:
             },
             "start_time": self.start_time,
             "end_time": self.end_time,
+            "training_status": self.training_status.value,
+            "enqueued_time": self.enqueued_time,
+            "fwd_bwd_done_time": self.fwd_bwd_done_time,
         }
 
 
@@ -281,33 +298,31 @@ def set_trajectory_completed(reward: float) -> None:
     _write_progress()
 
 
-def set_trajectory_enqueued() -> None:
+def set_group_enqueued(group: GroupProgress) -> None:
     """
-    Called: When forward_backward_async is invoked for this trajectory
-    Sets: training_status="enqueued", enqueued_time=now
-    Lifecycle: training_status: "pending" -> "enqueued"
+    Called: When forward_backward_async is invoked for this group's minibatch
+    Sets: training_status=ENQUEUED, enqueued_time=now
+    Lifecycle: training_status: PENDING -> ENQUEUED
     Meaning: Training request submitted to TPU, waiting for result
     """
-    traj = _get_current_trajectory()
-    if traj is None:
+    if not _enabled:
         return
-    traj.training_status = "enqueued"
-    traj.enqueued_time = time.time()
+    group.training_status = TrainingStatus.ENQUEUED
+    group.enqueued_time = time.time()
     _write_progress()
 
 
-def set_trajectory_fwd_bwd_done() -> None:
+def set_group_fwd_bwd_done(group: GroupProgress) -> None:
     """
-    Called: When forward_backward result is consumed
-    Sets: training_status="done", fwd_bwd_done_time=now
-    Lifecycle: training_status: "enqueued" -> "done"
-    Meaning: Training complete for this trajectory
+    Called: When forward_backward result is consumed for this group's minibatch
+    Sets: training_status=DONE, fwd_bwd_done_time=now
+    Lifecycle: training_status: ENQUEUED -> DONE
+    Meaning: Training complete for this group
     """
-    traj = _get_current_trajectory()
-    if traj is None:
+    if not _enabled:
         return
-    traj.training_status = "done"
-    traj.fwd_bwd_done_time = time.time()
+    group.training_status = TrainingStatus.DONE
+    group.fwd_bwd_done_time = time.time()
     _write_progress()
 
 
@@ -319,22 +334,17 @@ def set_trajectory_fwd_bwd_done() -> None:
 def set_new_optim_step() -> None:
     """
     Called: After optim_step completes (weights updated)
-    Action: Removes all groups where ALL trajectories have training_status="done"
+    Action: Removes all groups where training_status=DONE
     Purpose: Clean up finished groups from JSON state in one batch operation
-    Note: Groups still mid-training (some trajectories not "done") are kept
     """
     if not _enabled:
         return
 
     with _write_lock:
-        groups_to_remove = []
-        for gid, group in _active_groups.items():
-            all_done = all(
-                t.training_status == "done" for t in group.trajectories
-            )
-            if all_done:
-                groups_to_remove.append(gid)
-
+        groups_to_remove = [
+            gid for gid, group in _active_groups.items()
+            if group.training_status == TrainingStatus.DONE
+        ]
         for gid in groups_to_remove:
             del _active_groups[gid]
 

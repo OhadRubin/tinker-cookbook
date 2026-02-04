@@ -472,13 +472,10 @@ async def do_async_training(
 ):
     """Implements async off-policy training, capped at K steps off policy."""
     assert cfg.async_config is not None
+    num_workers = int(cfg.async_config.groups_per_batch * cfg.async_config.in_flight_ratio)
 
     shutdown_event = asyncio.Event()
-    # We will have groups_per_batch worker generating rollouts, so cap the
-    # queue size to be groups_per_batch.
-    env_group_builders_queue = asyncio.Queue[EnvGroupBuilder | None](
-        maxsize=cfg.async_config.groups_per_batch
-    )
+    env_group_builders_queue = asyncio.Queue[EnvGroupBuilder | None](maxsize=num_workers)
     trajectory_groups_queue = asyncio.Queue[WrappedTrajectoryGroup | None]()
 
     # Initial sampling client to use
@@ -500,8 +497,7 @@ async def do_async_training(
     def shutdown_loops():
         """Trigger all loops to shutdown"""
         shutdown_event.set()
-        assert cfg.async_config is not None
-        for _ in range(cfg.async_config.groups_per_batch):
+        for _ in range(num_workers):
             env_group_builders_queue.put_nowait(None)
         sampling_client_updated_event.set()
 
@@ -679,7 +675,7 @@ async def do_async_training(
             asyncio.create_task(
                 trajectory_group_worker_loop(), name=f"trajectory_group_worker_loop_{i}"
             )
-            for i in range(cfg.async_config.groups_per_batch)
+            for i in range(num_workers)
         ],
         asyncio.create_task(training_loop(), name="training_loop"),
         asyncio.create_task(evaluation_loop(), name="evaluation_loop"),

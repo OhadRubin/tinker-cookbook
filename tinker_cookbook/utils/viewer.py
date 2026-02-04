@@ -119,7 +119,7 @@ class RollingDurationStats:
         return len(self._durations)
 
 
-def watch(capture_file: str | None):
+def watch(capture_file: str | None, max_time_minutes: float | None):
     """Watch the progress file and display with rich."""
     from rich.console import Console, Group
     from rich.live import Live
@@ -369,7 +369,7 @@ def watch(capture_file: str | None):
 
         return Panel(text, title="Dashboard", border_style="bright_black", padding=(0, 1))
 
-    def build_table(state: dict) -> Table:
+    def build_table(state: dict, max_time_minutes: float | None) -> Table:
         import numpy as np
 
         groups = state.get("groups", {})
@@ -378,10 +378,25 @@ def watch(capture_file: str | None):
         now = time.time()
 
         # Limit to num_workers + 10 groups, keeping lowest group IDs (actively being processed)
-        max_display = num_workers + 10 if num_workers else None
-        if max_display and len(groups) > max_display:
-            sorted_gids = sorted(groups.keys(), key=int)[:max_display]
-            groups = {gid: groups[gid] for gid in sorted_gids}
+        # max_display = num_workers + 10 if num_workers else None
+        # if max_display and len(groups) > max_display:
+        #     sorted_gids = sorted(groups.keys(), key=int)[:max_display]
+        #     groups = {gid: groups[gid] for gid in sorted_gids}
+
+        # Filter out groups with elapsed time > max_time_minutes
+        if max_time_minutes is not None:
+            max_time_sec = max_time_minutes * 60
+            filtered_groups = {}
+            for gid, group in groups.items():
+                grp_start = group.get("start_time")
+                grp_end = group.get("end_time")
+                if grp_start:
+                    elapsed = (grp_end or now) - grp_start
+                    if elapsed <= max_time_sec:
+                        filtered_groups[gid] = group
+                else:
+                    filtered_groups[gid] = group
+            groups = filtered_groups
 
         table = Table(title="Trajectory Collection", expand=False, box=None)
         table.add_column("Grp", style="cyan", width=3, no_wrap=True)
@@ -599,7 +614,7 @@ def watch(capture_file: str | None):
         rolling.update(stats)
         feed_rolling_durations(state, rolling_enq_to_done, rolling_pend_to_sampled, rolling_e2e)
         dashboard = build_dashboard(stats, rolling, rolling_enq_to_done, rolling_pend_to_sampled, rolling_e2e)
-        table = build_table(state)
+        table = build_table(state, max_time_minutes)
         return Group(dashboard, table)
 
     console.print("[yellow]Watching /tmp/trajectory_progress.json...[/yellow]")
@@ -651,5 +666,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture", type=str, help="Write rendered table to this file on each update")
+    parser.add_argument("--max-time", type=float, help="Hide groups with elapsed time greater than X minutes")
     args = parser.parse_args()
-    watch(capture_file=args.capture)
+    watch(capture_file=args.capture, max_time_minutes=args.max_time)

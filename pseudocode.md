@@ -61,3 +61,40 @@ async def main(dataset, training_client, sampling_client):
         worker_pool(env_builders_q, groups_q, sampling_client),
         streaming_minibatch(groups_q, training_client),
     )
+
+
+
+# possible bottlenecks
+
+## Accurate Concerns
+
+**1. Sampling throughput is likely the primary bottleneck**
+- In `do_sync_training_with_stream_minibatch` (train.py:391-423), all `groups_per_batch` groups are launched simultaneously via `asyncio.create_task`
+- Each group spawns `group_size` parallel rollouts inside `custom_do_group_rollout` (verifiers_rl/train.py:223-226)
+- Net concurrency: `groups_per_batch × group_size` rollouts in flight (e.g., 32×8 = 256)
+
+**2. `trajectory_groups_queue` is unbounded** (train.py:387)
+- If training is slower than sampling, completed groups accumulate in memory
+- This is mitigated by the producer/consumer pattern in `run_substep` which blocks after consuming `groups_per_minibatch` groups
+
+**3. Queue size diagnostics are valuable**
+- Track `trajectory_groups_queue.qsize()` to detect if training lags sampling
+- Already have timing metrics (`time/trajectory_group_worker_loop/total`, `train/fwd_bwd_*`)
+
+## Implementation-Specific Concerns
+
+**1. Backpressure gap in streaming mode**
+- `trajectory_groups_queue` is unbounded (train.py:387)
+- All `groups_per_batch` sampling tasks are spawned immediately (train.py:419-423)
+- If TPU is slow, all groups complete before first minibatch trains → memory spike
+- Consider: bound the queue or spawn tasks incrementally
+
+**2. Retry backoff can amplify latency** (verifiers_rl/train.py:197-216)
+- On LLM errors, retries with exponential backoff (1s → 1.1× per retry, up to 30 retries)
+- A few slow trajectories can block entire group completion
+- Consider: timeout + skip trajectory instead of indefinite retry
+
+**3. `remove_constant_reward_groups` reduces effective batch size**
+- Groups with identical rewards are filtered (train.py:701-704, 867-869)
+- If many groups are filtered, actual training batch < configured batch
+- No learning rate scaling to compensate

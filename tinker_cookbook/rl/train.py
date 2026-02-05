@@ -806,6 +806,87 @@ async def compute_full_batch_metrics_and_get_sampling_client(
     return sampling_client, metrics
 
 
+async def run_substep(
+    i_substep: int,
+    i_batch: int,
+    cfg: Config,
+    trajectory_groups_queue: asyncio.Queue[WrappedTrajectoryGroup | None],
+    trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool],
+    training_client: tinker.TrainingClient,
+    service_client: tinker.ServiceClient,
+    tokenizer: Tokenizer,
+    groups_per_minibatch: int,
+    all_data_D: list[tinker.Datum],
+    all_wrapped_trajectory_groups: list[WrappedTrajectoryGroup],
+    all_training_logprobs_D: list[torch.Tensor],
+    metrics: dict[str, Any],
+) -> None:
+    """Run a single substep: accumulate minibatches, enqueue fwd_bwd, then optim_step."""
+    wrapped_trajectory_groups = []
+    forward_backward_futures: list[tinker.APIFuture[tinker.ForwardBackwardOutput]] = []
+    i_minibatch = 0
+    while i_minibatch < cfg.stream_minibatch_config.num_minibatches:
+        wrapped_trajectory_group = await trajectory_groups_queue.get()
+        if not trajectory_group_filter(wrapped_trajectory_group):
+            continue
+        wrapped_trajectory_groups.append(wrapped_trajectory_group)
+
+        if len(wrapped_trajectory_groups) < groups_per_minibatch:
+            continue
+        log.info("will train on minibatch", component="stream_minibatch", step=i_batch, substep=i_substep, num_substeps=cfg.num_substeps, minibatch=i_minibatch, num_minibatches=cfg.stream_minibatch_config.num_minibatches, num_groups=len(wrapped_trajectory_groups))
+
+        # Note: we may have removed trajectory groups that have the same reward.
+        # To have the same results as the sync implementation, we will
+        # remove these and train on a smaller batch.
+        wrapped_trajectory_groups = [g for g in wrapped_trajectory_groups if g is not None]
+        if len(wrapped_trajectory_groups) == 0:
+            i_minibatch += 1
+            continue
+
+        data_D, prepare_minibatch_metrics = await prepare_minibatch(
+            [g.env_group_builder for g in wrapped_trajectory_groups],
+            [g.trajectory_group for g in wrapped_trajectory_groups],
+            tokenizer,
+            service_client,
+            model_name=cfg.model_name,
+            kl_penalty_coef=cfg.kl_penalty_coef,
+            kl_discount_factor=cfg.kl_discount_factor,
+        )
+        metrics.update(prepare_minibatch_metrics)
+
+        # Enqueue forward-backward (we'll await results after all minibatches are enqueued)
+        minibatch_builders = [g.env_group_builder for g in wrapped_trajectory_groups]
+        _mark_groups_enqueued(minibatch_builders)
+        with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_enqueue", metrics):
+            forward_backward_futures.append((
+                await training_client.forward_backward_async(
+                    [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
+                ),
+                minibatch_builders,  # track builders for this future
+            ))
+        all_data_D.extend(data_D)
+        all_wrapped_trajectory_groups.extend(wrapped_trajectory_groups)
+        i_minibatch += 1
+        wrapped_trajectory_groups = []
+
+    # Enqueue optim_step before awaiting results (so they land on same clock cycle)
+    adam_params = tinker.AdamParams(
+        learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
+    )
+    with timed(f"train/optim_substep_{i_substep}_enqueue", metrics):
+        optim_future = await training_client.optim_step_async(adam_params)
+
+    # Now consume all forward-backward results
+    for i_mb, (fwd_bwd_future, minibatch_builders) in enumerate(forward_backward_futures):
+        with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume", metrics):
+            fwd_bwd_result = await fwd_bwd_future.result_async()
+            all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
+            _mark_groups_fwd_bwd_done(minibatch_builders)
+
+    with timed(f"train/optim_substep_{i_substep}_consume", metrics):
+        await optim_future.result_async()
+        set_new_optim_step()
+
 @scope
 async def do_train_step_streaming_and_get_sampling_client(
     cfg: Config,
@@ -841,72 +922,22 @@ async def do_train_step_streaming_and_get_sampling_client(
     all_training_logprobs_D = []
     all_wrapped_trajectory_groups = []
     for i_substep in range(cfg.num_substeps):
-        # Run multiple minibatches per substep
-        # Once we have enough trajectories for a minibatch, train on them
-        wrapped_trajectory_groups = []
-        forward_backward_futures: list[tinker.APIFuture[tinker.ForwardBackwardOutput]] = []
-        i_minibatch = 0
-        while i_minibatch < cfg.stream_minibatch_config.num_minibatches:
-            wrapped_trajectory_group = await trajectory_groups_queue.get()
-            if not trajectory_group_filter(wrapped_trajectory_group):
-                continue
-            wrapped_trajectory_groups.append(wrapped_trajectory_group)
-
-            if len(wrapped_trajectory_groups) < groups_per_minibatch:
-                continue
-            log.info("will train on minibatch", component="stream_minibatch", step=i_batch, substep=i_substep, num_substeps=cfg.num_substeps, minibatch=i_minibatch, num_minibatches=cfg.stream_minibatch_config.num_minibatches, num_groups=len(wrapped_trajectory_groups))
-
-            # Note: we may have removed trajectory groups that have the same reward.
-            # To have the same results as the sync implementation, we will
-            # remove these and train on a smaller batch.
-            wrapped_trajectory_groups = [g for g in wrapped_trajectory_groups if g is not None]
-            if len(wrapped_trajectory_groups) == 0:
-                i_minibatch += 1
-                continue
-
-            data_D, prepare_minibatch_metrics = await prepare_minibatch(
-                [g.env_group_builder for g in wrapped_trajectory_groups],
-                [g.trajectory_group for g in wrapped_trajectory_groups],
-                tokenizer,
-                service_client,
-                model_name=cfg.model_name,
-                kl_penalty_coef=cfg.kl_penalty_coef,
-                kl_discount_factor=cfg.kl_discount_factor,
-            )
-            metrics.update(prepare_minibatch_metrics)
-
-            # Enqueue forward-backward (we'll await results after all minibatches are enqueued)
-            minibatch_builders = [g.env_group_builder for g in wrapped_trajectory_groups]
-            _mark_groups_enqueued(minibatch_builders)
-            with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_enqueue", metrics):
-                forward_backward_futures.append((
-                    await training_client.forward_backward_async(
-                        [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
-                    ),
-                    minibatch_builders,  # track builders for this future
-                ))
-            all_data_D.extend(data_D)
-            all_wrapped_trajectory_groups.extend(wrapped_trajectory_groups)
-            i_minibatch += 1
-            wrapped_trajectory_groups = []
-
-        # Enqueue optim_step before awaiting results (so they land on same clock cycle)
-        adam_params = tinker.AdamParams(
-            learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
+        await run_substep(
+            i_substep=i_substep,
+            i_batch=i_batch,
+            cfg=cfg,
+            trajectory_groups_queue=trajectory_groups_queue,
+            trajectory_group_filter=trajectory_group_filter,
+            training_client=training_client,
+            service_client=service_client,
+            tokenizer=tokenizer,
+            groups_per_minibatch=groups_per_minibatch,
+            all_data_D=all_data_D,
+            all_wrapped_trajectory_groups=all_wrapped_trajectory_groups,
+            all_training_logprobs_D=all_training_logprobs_D,
+            metrics=metrics,
         )
-        with timed(f"train/optim_substep_{i_substep}_enqueue", metrics):
-            optim_future = await training_client.optim_step_async(adam_params)
 
-        # Now consume all forward-backward results
-        for i_mb, (fwd_bwd_future, minibatch_builders) in enumerate(forward_backward_futures):
-            with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume", metrics):
-                fwd_bwd_result = await fwd_bwd_future.result_async()
-                all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
-                _mark_groups_fwd_bwd_done(minibatch_builders)
-
-        with timed(f"train/optim_substep_{i_substep}_consume", metrics):
-            await optim_future.result_async()
-            set_new_optim_step()
 
     # Aggregate metrics across the entire batch
     metrics.update(compute_sampling_client_metrics(all_wrapped_trajectory_groups))

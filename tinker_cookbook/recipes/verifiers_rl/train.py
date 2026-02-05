@@ -93,7 +93,9 @@ class CLIConfig:
     # training hyperparameters
     group_size: int = 8
     groups_per_batch: int = 32
-    num_substeps: int = 1
+    # how often we replace the sampling checkpoint w.r.t number of optim steps.
+    #  1 = every time, 2 = we do 2 optim steps with the same sampling checkpoint
+    num_substeps: int = 1 
     learning_rate: float = 1e-5
     max_tokens: int = 512
     max_context_length: int

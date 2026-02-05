@@ -8,12 +8,13 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator, List, Sequence
+from typing import Any, Callable, Coroutine, Iterator, List, Sequence
 
 import chz
 import numpy as np
 import tinker
 import torch
+from tinker.lib.public_interfaces import APIFuture
 from tinker.types import LossFnType
 from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.completers import TinkerTokenCompleter
@@ -806,6 +807,134 @@ async def compute_full_batch_metrics_and_get_sampling_client(
     return sampling_client, metrics
 
 
+@chz.chz
+class PreparedMinibatch:
+    """Passed from producer to consumer via queue."""
+    fwd_bwd_future: APIFuture[tinker.ForwardBackwardOutput]
+    builders: Sequence[EnvGroupBuilder]
+
+
+@chz.chz
+class OptimStepMarker:
+    """Signals end of minibatches, contains optim future."""
+    optim_future: APIFuture[tinker.OptimStepResponse]
+
+
+def _create_producer_consumer(
+    *,
+    i_substep: int,
+    i_batch: int,
+    cfg: Config,
+    trajectory_groups_queue: asyncio.Queue[WrappedTrajectoryGroup | None],
+    trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool],
+    training_client: tinker.TrainingClient,
+    service_client: tinker.ServiceClient,
+    tokenizer: Tokenizer,
+    groups_per_minibatch: int,
+    prepared_queue: asyncio.Queue[PreparedMinibatch | OptimStepMarker],
+    # Mutable references - will be extended in place
+    all_data_D: list[tinker.Datum],
+    all_wrapped_trajectory_groups: list[WrappedTrajectoryGroup],
+    all_training_logprobs_D: list[torch.Tensor],
+    metrics: dict[str, Any],
+) -> tuple[Callable[[], Coroutine[Any, Any, None]], Callable[[], Coroutine[Any, Any, None]]]:
+    """
+    Factory function that creates producer and consumer coroutines.
+
+    Binds all required variables so producer/consumer can be called without arguments.
+    Mutates the passed-in lists directly (same pattern as current run_substep).
+    """
+    num_minibatches = cfg.stream_minibatch_config.num_minibatches
+
+    async def producer() -> None:
+        """Pull groups, prepare minibatches, enqueue fwd_bwd futures."""
+        wrapped_trajectory_groups: list[WrappedTrajectoryGroup] = []
+        i_minibatch = 0
+
+        while i_minibatch < num_minibatches:
+            wrapped_trajectory_group = await trajectory_groups_queue.get()
+            if not trajectory_group_filter(wrapped_trajectory_group):
+                continue
+            wrapped_trajectory_groups.append(wrapped_trajectory_group)
+
+            if len(wrapped_trajectory_groups) < groups_per_minibatch:
+                continue
+            log.info("will train on minibatch", component="stream_minibatch", step=i_batch, substep=i_substep, num_substeps=cfg.num_substeps, minibatch=i_minibatch, num_minibatches=cfg.stream_minibatch_config.num_minibatches, num_groups=len(wrapped_trajectory_groups))
+
+            # Note: we may have removed trajectory groups that have the same reward.
+            # To have the same results as the sync implementation, we will
+            # remove these and train on a smaller batch.
+            wrapped_trajectory_groups = [g for g in wrapped_trajectory_groups if g is not None]
+            if len(wrapped_trajectory_groups) == 0:
+                i_minibatch += 1
+                continue
+
+            data_D, prepare_minibatch_metrics = await prepare_minibatch(
+                [g.env_group_builder for g in wrapped_trajectory_groups],
+                [g.trajectory_group for g in wrapped_trajectory_groups],
+                tokenizer,
+                service_client,
+                model_name=cfg.model_name,
+                kl_penalty_coef=cfg.kl_penalty_coef,
+                kl_discount_factor=cfg.kl_discount_factor,
+            )
+            metrics.update(prepare_minibatch_metrics)
+
+            # Enqueue forward-backward (we'll await results after all minibatches are enqueued)
+            minibatch_builders = [g.env_group_builder for g in wrapped_trajectory_groups]
+            _mark_groups_enqueued(minibatch_builders)
+            with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_enqueue", metrics):
+                fwd_bwd_future = await training_client.forward_backward_async(
+                    [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
+                )
+
+            # Pass to consumer immediately (don't wait for result)
+            await prepared_queue.put(PreparedMinibatch(
+                fwd_bwd_future=fwd_bwd_future,
+                builders=minibatch_builders,
+            ))
+
+            all_data_D.extend(data_D)
+            all_wrapped_trajectory_groups.extend(wrapped_trajectory_groups)
+
+            i_minibatch += 1
+            wrapped_trajectory_groups = []
+
+        # All minibatches enqueued, now enqueue optim_step
+        adam_params = tinker.AdamParams(
+            learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
+        )
+        with timed(f"train/optim_substep_{i_substep}_enqueue", metrics):
+            optim_future = await training_client.optim_step_async(adam_params)
+
+        # Signal end of production
+        await prepared_queue.put(OptimStepMarker(optim_future=optim_future))
+
+    async def consumer() -> None:
+        """Await fwd_bwd futures as they arrive, then await optim_step."""
+        i_minibatch = 0
+        while True:
+            item = await prepared_queue.get()
+
+            if isinstance(item, OptimStepMarker):
+                # All fwd_bwd done, await optim_step
+                with timed(f"train/optim_substep_{i_substep}_consume", metrics):
+                    await item.optim_future.result_async()
+                    set_new_optim_step()
+                break
+
+            # It's a PreparedMinibatch - await its fwd_bwd result
+            with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_consume", metrics):
+                result = await item.fwd_bwd_future.result_async()
+                all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(result))
+                _mark_groups_fwd_bwd_done(item.builders)
+
+            i_minibatch += 1
+
+    return producer, consumer
+
+
+@scope
 async def run_substep(
     i_substep: int,
     i_batch: int,
@@ -821,71 +950,55 @@ async def run_substep(
     all_training_logprobs_D: list[torch.Tensor],
     metrics: dict[str, Any],
 ) -> None:
-    """Run a single substep: accumulate minibatches, enqueue fwd_bwd, then optim_step."""
-    wrapped_trajectory_groups = []
-    forward_backward_futures: list[tinker.APIFuture[tinker.ForwardBackwardOutput]] = []
-    i_minibatch = 0
-    while i_minibatch < cfg.stream_minibatch_config.num_minibatches:
-        wrapped_trajectory_group = await trajectory_groups_queue.get()
-        if not trajectory_group_filter(wrapped_trajectory_group):
-            continue
-        wrapped_trajectory_groups.append(wrapped_trajectory_group)
+    """
+    Run a single substep using producer/consumer pattern.
 
-        if len(wrapped_trajectory_groups) < groups_per_minibatch:
-            continue
-        log.info("will train on minibatch", component="stream_minibatch", step=i_batch, substep=i_substep, num_substeps=cfg.num_substeps, minibatch=i_minibatch, num_minibatches=cfg.stream_minibatch_config.num_minibatches, num_groups=len(wrapped_trajectory_groups))
+    Producer prepares minibatches and enqueues fwd_bwd futures.
+    Consumer awaits results concurrently.
+    Overlap: while consumer awaits minibatch N, producer prepares minibatch N+1.
+    """
+    # Queue for passing prepared minibatches from producer to consumer
+    prepared_queue: asyncio.Queue[PreparedMinibatch | OptimStepMarker] = asyncio.Queue()
 
-        # Note: we may have removed trajectory groups that have the same reward.
-        # To have the same results as the sync implementation, we will
-        # remove these and train on a smaller batch.
-        wrapped_trajectory_groups = [g for g in wrapped_trajectory_groups if g is not None]
-        if len(wrapped_trajectory_groups) == 0:
-            i_minibatch += 1
-            continue
-
-        data_D, prepare_minibatch_metrics = await prepare_minibatch(
-            [g.env_group_builder for g in wrapped_trajectory_groups],
-            [g.trajectory_group for g in wrapped_trajectory_groups],
-            tokenizer,
-            service_client,
-            model_name=cfg.model_name,
-            kl_penalty_coef=cfg.kl_penalty_coef,
-            kl_discount_factor=cfg.kl_discount_factor,
-        )
-        metrics.update(prepare_minibatch_metrics)
-
-        # Enqueue forward-backward (we'll await results after all minibatches are enqueued)
-        minibatch_builders = [g.env_group_builder for g in wrapped_trajectory_groups]
-        _mark_groups_enqueued(minibatch_builders)
-        with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_enqueue", metrics):
-            forward_backward_futures.append((
-                await training_client.forward_backward_async(
-                    [_remove_mask(d) for d in data_D], loss_fn=cfg.loss_fn
-                ),
-                minibatch_builders,  # track builders for this future
-            ))
-        all_data_D.extend(data_D)
-        all_wrapped_trajectory_groups.extend(wrapped_trajectory_groups)
-        i_minibatch += 1
-        wrapped_trajectory_groups = []
-
-    # Enqueue optim_step before awaiting results (so they land on same clock cycle)
-    adam_params = tinker.AdamParams(
-        learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
+    # Create producer and consumer with all variables bound
+    producer, consumer = _create_producer_consumer(
+        i_substep=i_substep,
+        i_batch=i_batch,
+        cfg=cfg,
+        trajectory_groups_queue=trajectory_groups_queue,
+        trajectory_group_filter=trajectory_group_filter,
+        training_client=training_client,
+        service_client=service_client,
+        tokenizer=tokenizer,
+        groups_per_minibatch=groups_per_minibatch,
+        prepared_queue=prepared_queue,
+        all_data_D=all_data_D,
+        all_wrapped_trajectory_groups=all_wrapped_trajectory_groups,
+        all_training_logprobs_D=all_training_logprobs_D,
+        metrics=metrics,
     )
-    with timed(f"train/optim_substep_{i_substep}_enqueue", metrics):
-        optim_future = await training_client.optim_step_async(adam_params)
 
-    # Now consume all forward-backward results
-    for i_mb, (fwd_bwd_future, minibatch_builders) in enumerate(forward_backward_futures):
-        with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume", metrics):
-            fwd_bwd_result = await fwd_bwd_future.result_async()
-            all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
-            _mark_groups_fwd_bwd_done(minibatch_builders)
+    # Run producer and consumer concurrently with error propagation
+    producer_task = asyncio.create_task(producer(), name=f"producer_substep_{i_substep}")
+    consumer_task = asyncio.create_task(consumer(), name=f"consumer_substep_{i_substep}")
 
-    with timed(f"train/optim_substep_{i_substep}_consume", metrics):
-        await optim_future.result_async()
-        set_new_optim_step()
+    done, pending = await asyncio.wait(
+        [producer_task, consumer_task],
+        return_when=asyncio.FIRST_EXCEPTION,
+    )
+
+    # If we have pending tasks, one task failed - cancel the other
+    for task in pending:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # Re-raise any exception from completed tasks
+    for task in done:
+        task.result()  # raises if task failed
+
 
 @scope
 async def do_train_step_streaming_and_get_sampling_client(

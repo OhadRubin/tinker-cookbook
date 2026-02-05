@@ -4,15 +4,20 @@
 #   trajectory: PENDING → IN_PROGRESS → SAMPLED → COMPLETED
 #   group.training: PENDING → ENQUEUED → DONE
 
-async def worker_pool(env_builders_q, groups_q):
+async def do_group_rollout(builder, client):
+    # run N rollouts in parallel, one per trajectory
+    states = await gather(*[
+        run_rollout(inp, client)  # traj: PENDING → IN_PROGRESS → SAMPLED
+        for inp in builder.get_rollout_inputs()
+    ])
+    await score_group(states)  # traj: SAMPLED → COMPLETED
+    return to_trajectory_group(states)
+
+async def worker_pool(env_builders_q, groups_q, client):
 
     async def worker():
         while (builder := await env_builders_q.get()) is not None:
-            for traj in builder.trajectories:
-                traj.status = IN_PROGRESS
-            group = await rollout(builder)  # traj → SAMPLED after each rollout
-            for traj in group.trajectories:
-                traj.status = COMPLETED  # after reward assigned
+            group = await do_group_rollout(builder, client)
             groups_q.put_nowait(group)
 
     await gather(*[worker() for _ in range(N)])
@@ -47,12 +52,12 @@ async def streaming_minibatch(groups_q, training_client):
 
     await gather(producer(), consumer())
 
-async def main(dataset, training_client):
+async def main(dataset, training_client, sampling_client):
     env_builders_q = Queue(maxsize=N)
     groups_q = Queue()
 
     await gather(
         dataloader(dataset, env_builders_q),
-        worker_pool(env_builders_q, groups_q),
+        worker_pool(env_builders_q, groups_q, sampling_client),
         streaming_minibatch(groups_q, training_client),
     )

@@ -1,64 +1,58 @@
-# 1. Pipelined Futures
-async def pipelined_train(batches):
-    curr_future = await enqueue(batches[0])
-    for i, batch in enumerate(batches):
-        next_future = await enqueue(batches[i+1]) if i+1 < len(batches) else None
-        await curr_future.result()
-        curr_future = next_future
+# group: N trajectories from the same prompt (training unit)
+#
+# Status transitions:
+#   trajectory: PENDING → IN_PROGRESS → SAMPLED → COMPLETED
+#   group.training: PENDING → ENQUEUED → DONE
 
-# 2. Worker Pool
-async def worker_pool():
-    input_q, output_q = Queue(maxsize=N), Queue()
+async def worker_pool(env_builders_q, groups_q):
 
     async def worker():
-        while (item := await input_q.get()) is not None:
-            result = await process(item)
-            output_q.put_nowait(result)
+        while (builder := await env_builders_q.get()) is not None:
+            for traj in builder.trajectories:
+                traj.status = IN_PROGRESS
+            group = await rollout(builder)  # traj → SAMPLED after each rollout
+            for traj in group.trajectories:
+                traj.status = COMPLETED  # after reward assigned
+            groups_q.put_nowait(group)
 
-    await gather(feeder(), *[worker() for _ in range(N)], consumer())
+    await gather(*[worker() for _ in range(N)])
 
-# 3. Producer-Consumer with Future Handoff
-async def streaming_minibatch():
+async def dataloader(dataset, env_builders_q):
+    for batch_idx in range(len(dataset)):
+        for builder in dataset.get_batch(batch_idx):
+            await env_builders_q.put(builder)
+    await env_builders_q.put(DONE)
+
+async def streaming_minibatch(groups_q, training_client):
     handoff_q = Queue()
 
     async def producer():
-        for batch in batches:
-            data = await prepare(batch)
-            future = await enqueue_to_tpu(data)
-            await handoff_q.put(future)  # hand off future, not result
-        await handoff_q.put(DONE)
+        while (group := await groups_q.get()) is not DONE:
+            data = await prepare(group)  # CPU-bound but almost instantaneous
+            group.training_status = ENQUEUED
+            fwd_bwd_future = await training_client.forward_backward_async(data)
+            await handoff_q.put((fwd_bwd_future, group))
+        # all minibatches enqueued, now enqueue optim_step
+        optim_future = await training_client.optim_step_async()
+        await handoff_q.put(optim_future)
 
     async def consumer():
-        while (future := await handoff_q.get()) is not DONE:
-            await future.result()  # wait for TPU while producer prepares next
+        while (item := await handoff_q.get()):
+            if is_optim_future(item):
+                await item.result()  # apply gradients
+                break
+            fwd_bwd_future, group = item
+            await fwd_bwd_future.result()  # wait for TPU while producer prepares next
+            group.training_status = DONE
 
     await gather(producer(), consumer())
 
-# 4. Event-Based Coordination
-async def event_coordination():
-    event = Event()
-    shared_state = None
+async def main(dataset, training_client):
+    env_builders_q = Queue(maxsize=N)
+    groups_q = Queue()
 
-    async def trainer():
-        nonlocal shared_state
-        for batch in batches:
-            shared_state = await train(batch)
-            event.set()
-
-    async def evaluator():
-        while not done:
-            await event.wait()
-            event.clear()
-            await evaluate(shared_state)
-
-    await gather(trainer(), evaluator())
-
-# 5. Stale Sample Requeue
-async def training_loop():
-    while i < end:
-        sample = await output_q.get()
-        if sample.age > max_age:
-            create_task(input_q.put(sample.source))  # requeue, don't await
-            continue
-        await train(sample)
-        i += 1
+    await gather(
+        dataloader(dataset, env_builders_q),
+        worker_pool(env_builders_q, groups_q),
+        streaming_minibatch(groups_q, training_client),
+    )

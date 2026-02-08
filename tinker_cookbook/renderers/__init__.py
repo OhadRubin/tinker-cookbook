@@ -24,6 +24,8 @@ def get_renderer(
         return Qwen3DisableThinkingRenderer(tokenizer)
     elif name == "qwen3_instruct":
         return Qwen3InstructRenderer(tokenizer)
+    elif name == "qwen3_coder":
+        return Qwen3CoderRenderer(tokenizer)
     elif name == "deepseekv3":
         return DeepSeekV3Renderer(tokenizer)
     elif name == "deepseekv3_disable_thinking":

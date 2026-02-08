@@ -6,6 +6,7 @@ context managers for lifecycle management. Module-level functions operate
 on the current trajectory from context.
 
 The JSON state file is watched by viewer.py for real-time display.
+Stats are also emitted to Loki via training_stats for Grafana dashboards.
 """
 
 from __future__ import annotations
@@ -18,9 +19,24 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    from tinker_cookbook.utils.training_stats import TrainingPipelineStats
 
 PROGRESS_FILE = Path("/tmp/trajectory_progress.json")
+
+# Lazy import to avoid circular dependencies
+_training_stats: "TrainingPipelineStats | None" = None
+
+
+def _get_training_stats() -> "TrainingPipelineStats":
+    """Lazy import of training_stats singleton."""
+    global _training_stats
+    if _training_stats is None:
+        from tinker_cookbook.utils.training_stats import training_stats
+        _training_stats = training_stats
+    return _training_stats
 
 
 class TrajectoryStatus(Enum):
@@ -159,11 +175,17 @@ class GroupProgress:
         """Registers group on enter, unregisters on exit."""
         self.start_time = time.time()
         _register_group(self)
+        if _enabled:
+            _get_training_stats().sampling_started_sync()
         try:
             yield self
         finally:
             self.end_time = time.time()
             _write_progress()
+            # Record sampling completion with latency
+            if _enabled and self.start_time is not None:
+                latency_ms = (self.end_time - self.start_time) * 1000
+                _get_training_stats().sampling_completed_sync(latency_ms)
 
     def to_dict(self) -> dict:
         """JSON serialization for watch() display."""
@@ -310,6 +332,7 @@ def set_group_enqueued(group: GroupProgress) -> None:
     group.training_status = TrainingStatus.ENQUEUED
     group.enqueued_time = time.time()
     _write_progress()
+    _get_training_stats().training_started_sync()
 
 
 def set_group_fwd_bwd_done(group: GroupProgress) -> None:
@@ -324,6 +347,14 @@ def set_group_fwd_bwd_done(group: GroupProgress) -> None:
     group.training_status = TrainingStatus.DONE
     group.fwd_bwd_done_time = time.time()
     _write_progress()
+    # Record training completion with latencies
+    stats = _get_training_stats()
+    if group.enqueued_time is not None:
+        training_latency_ms = (group.fwd_bwd_done_time - group.enqueued_time) * 1000
+        stats.training_completed_sync(training_latency_ms, num_groups=1)
+    if group.start_time is not None:
+        e2e_latency_ms = (group.fwd_bwd_done_time - group.start_time) * 1000
+        stats.record_e2e_latency_sync(e2e_latency_ms)
 
 
 # =============================================================================
@@ -349,3 +380,4 @@ def set_new_optim_step() -> None:
             del _active_groups[gid]
 
     _write_progress()
+    _get_training_stats().record_optim_step_sync()

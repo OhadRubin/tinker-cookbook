@@ -95,8 +95,9 @@ class CLIConfig:
     groups_per_batch: int = 32
     # how often we replace the sampling checkpoint w.r.t number of optim steps.
     #  1 = every time, 2 = we do 2 optim steps with the same sampling checkpoint
-    num_substeps: int = 1 
+    num_substeps: int = 1
     learning_rate: float = 1e-5
+    n_warmup_steps: int = 0
     max_tokens: int = 512
     max_context_length: int
     temperature: float = 1.0
@@ -190,7 +191,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         progress = GroupProgress.create(cli_config.group_size)
         builder.progress = progress
 
-        async def run_rollout_with_context(traj_idx: int, rollout_input, max_retries: int = 30):
+        async def run_rollout_with_context(traj_idx: int, rollout_input, max_retries: int = 5):
             with progress.trajectories[traj_idx].context():
                 set_trajectory_in_progress()
                 result: vf.State | None = None
@@ -200,7 +201,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                         rollout_input, shared_client, "tinker", gen_sampling_args, gen_sem
                     )
                     error = result.get("error", None)
-                    if isinstance(error, vf.Error):
+                    if isinstance(error, vf.Error) or error is not None:
                           # TODO: we will consider adding a feature that would check if a lot of trajectories failed and pause everything
                         # or a feature that would reset backoff_seconds according to a switch i could toggle via a file?
                         log.error("run_rollout_with_context attempt failed", component="verifiers_rl", content=str(error),
@@ -259,6 +260,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
 
     cfg = train.Config(
         learning_rate=cli_config.learning_rate,
+        n_warmup_steps=cli_config.n_warmup_steps,
         dataset_builder=dataset_builder,
         model_name=cli_config.model_name,
         max_tokens=cli_config.max_tokens,

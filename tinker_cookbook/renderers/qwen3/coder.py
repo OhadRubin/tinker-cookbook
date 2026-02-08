@@ -1,10 +1,13 @@
 """Module for Qwen3 Coder models with XML-based tool calling."""
 
 import re
-from .base import *
+from .base import Qwen3Renderer, RenderedMessage, Message, ToolCall, Tokenizer
+from ..base import _tool_call_payload
+import tinker
+import json
 
 
-class Qwen3CoderRenderer(Renderer):
+class Qwen3CoderRenderer(Qwen3Renderer):
     """
     Renderer for Qwen3 Coder models that use XML-structured tool calling format.
 
@@ -46,55 +49,210 @@ class Qwen3CoderRenderer(Renderer):
     optimized for coding tasks rather than reasoning with thinking tokens.
     """
 
-    def render_message(self, idx: int, message: Message, is_last: bool = False) -> RenderedMessage:
+    # Default system message when tools are present but no system message provided
+    # Matches qwen3_coder.jinja2 line 28
+    DEFAULT_SYSTEM_MESSAGE = "You are Qwen, a helpful AI assistant that can interact with a computer to solve tasks."
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        tools: list[dict] | None = None,
+    ):
+        super().__init__(tokenizer, strip_thinking_from_history=True, tools=tools)
+
+    def _group_tool_messages(self, messages: list[Message]) -> list[Message]:
+        """
+        Group consecutive tool messages under a single user message.
+
+        Matches qwen3_coder.jinja2 lines 99-110:
+        - No leading newline before first <tool_response>
+        - Trailing newline after each </tool_response>
+        """
+        grouped: list[Message] = []
+        i = 0
+        while i < len(messages):
+            if messages[i]["role"] == "tool":
+                tool_responses: list[str] = []
+                while i < len(messages) and messages[i]["role"] == "tool":
+                    content = messages[i]["content"]
+                    assert isinstance(content, str)
+                    tool_responses.append(content)
+                    i += 1
+
+                # Match jinja2: <tool_response>\ncontent\n</tool_response>\n
+                combined_content = ""
+                for resp in tool_responses:
+                    combined_content += f"<tool_response>\n{resp}\n</tool_response>\n"
+
+                grouped.append(Message(role="user", content=combined_content))
+            else:
+                grouped.append(messages[i])
+                i += 1
+
+        return grouped
+
+    def render_message(
+        self,
+        idx: int,
+        message: Message,
+        is_last: bool = False,
+        last_query_index: int | None = None,
+    ) -> RenderedMessage:
+        """
+        Render a message without <think> tag support.
+
+        Tool messages should have been grouped by _group_tool_messages in base class
+        before this method is called from build_generation_prompt or build_supervised_example.
+        """
         assert message.get("thinking") is None, "Thinking blocks not supported in Qwen3CoderRenderer"
-        assert isinstance(message["content"], str), (
-            "Qwen3CoderRenderer only supports message with string content"
+        assert message.get("reasoning_content") is None, "Reasoning not supported in Qwen3CoderRenderer"
+
+        role = message["role"]
+
+        # Tool messages should have been grouped by _group_tool_messages in base class
+        assert role != "tool", (
+            "Tool messages should be grouped by build_generation_prompt or build_supervised_example"
         )
 
-        # Handle tool responses specially - they are wrapped in user messages
-        # Following the jinja2 template behavior where role="tool" messages
-        # get wrapped in <|im_start|>user\n<tool_response>...<|im_end|>
-        if message["role"] == "tool":
-            maybe_newline = "\n" if idx > 0 else ""
-            ob_str = f"{maybe_newline}<|im_start|>user\n"
-            ac_content = f"<tool_response>\n{message['content']}\n</tool_response><|im_end|>"
+        # Handle assistant messages with tool_calls (jinja2 lines 76-96)
+        if role == "assistant" and message.get("tool_calls"):
+            ob_str = f"<|im_start|>{role}"
+            content = message.get("content", "")
+
+            ac_content = ""
+            if isinstance(content, str) and content.strip():
+                # jinja2 line 79: '\n' + message.content | trim + '\n'
+                ac_content += f"\n{content.strip()}\n"
+
+            for tool_call in message["tool_calls"]:
+                ac_content += self._render_tool_call(tool_call)
+
+            ac_content += "<|im_end|>\n"
 
             prefix = tinker.types.EncodedTextChunk(
                 tokens=self.tokenizer.encode(ob_str, add_special_tokens=False)
             )
-            content: list[tinker.ModelInputChunk] = [
+            content_chunks: list[tinker.ModelInputChunk] = [
                 tinker.types.EncodedTextChunk(
                     tokens=self.tokenizer.encode(ac_content, add_special_tokens=False)
                 )
             ]
-            return RenderedMessage(prefix=prefix, content=content)
+            return RenderedMessage(prefix=prefix, content=content_chunks)
 
-        # Handle regular messages
-        maybe_newline = "\n" if idx > 0 else ""
-        ob_str = f"{maybe_newline}<|im_start|>{message['role']}\n"
-        ac_content = message["content"]
+        # Regular message handling (jinja2 line 98)
+        assert isinstance(message["content"], str), (
+            "Qwen3CoderRenderer only supports message with string content"
+        )
 
-        # Handle tool calls - render them in XML format
-        # Commented out: content already contains <tool_call> from model output
-        # if "tool_calls" in message:
-        #     for tool_call in message["tool_calls"]:
-        #         ac_content += self._render_tool_call(tool_call)
+        # jinja2 line 98: '<|im_start|>' + role + '\n' + content + '<|im_end|>' + '\n'
+        ob_str = f"<|im_start|>{role}\n"
+        ac_content = message["content"] + "<|im_end|>\n"
 
-        ac_content += "<|im_end|>"
-
-        # Encode the parts
         prefix = tinker.types.EncodedTextChunk(
             tokens=self.tokenizer.encode(ob_str, add_special_tokens=False)
         )
-        content: list[tinker.ModelInputChunk] = [
+        content_chunks: list[tinker.ModelInputChunk] = [
             tinker.types.EncodedTextChunk(
                 tokens=self.tokenizer.encode(ac_content, add_special_tokens=False)
             )
         ]
-        return RenderedMessage(prefix=prefix, content=content)
+        return RenderedMessage(prefix=prefix, content=content_chunks)
 
-    def _render_tool_call(self, tool_call: ToolCall) -> str:
+    def _render_extra_keys(self, json_dict: dict | None, handled_keys: list[str]) -> str:
+        """
+        Render extra keys from a JSON dict that aren't in the handled_keys list.
+
+        Mirrors the render_extra_keys macro from qwen3_coder.jinja2.
+        Handles JSON schema fields like 'enum', 'required', 'items', etc.
+        """
+        if not isinstance(json_dict, dict):
+            return ""
+
+        result = ""
+        for key in json_dict:
+            if key not in handled_keys:
+                value = json_dict[key]
+                if isinstance(value, (dict, list)):
+                    result += f"\n<{key}>{json.dumps(value)}</{key}>"
+                else:
+                    result += f"\n<{key}>{value}</{key}>"
+        return result
+
+    def _build_tools_system_message(self, system_content: str = "") -> str:
+        """
+        Build a system message that includes tool definitions in XML format.
+
+        Follows the qwen3_coder.jinja2 template format.
+        """
+        if not self.tools:
+            return system_content
+
+        tools_section = "\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>"
+
+        for tool in self.tools:
+            # Handle both {"function": {...}} and direct tool format
+            tool_def = tool.get("function", tool)
+            name = tool_def.get("name", "")
+            description = tool_def.get("description", "")
+            parameters = tool_def.get("parameters", {})
+
+            tools_section += f"\n<function>\n<name>{name}</name>"
+            if description:
+                tools_section += f"\n<description>{description.strip()}</description>"
+            tools_section += "\n<parameters>"
+
+            # Render parameters
+            properties = parameters.get("properties", {})
+            for param_name, param_fields in properties.items():
+                tools_section += "\n<parameter>"
+                tools_section += f"\n<name>{param_name}</name>"
+                if "type" in param_fields:
+                    tools_section += f"\n<type>{param_fields['type']}</type>"
+                if "description" in param_fields:
+                    tools_section += f"\n<description>{param_fields['description'].strip()}</description>"
+                # Render extra parameter fields (enum, items, default, etc.)
+                tools_section += self._render_extra_keys(param_fields, ["name", "type", "description"])
+                tools_section += "\n</parameter>"
+
+            # Render extra fields in parameters object (e.g., 'required')
+            tools_section += self._render_extra_keys(parameters, ["type", "properties"])
+            tools_section += "\n</parameters>"
+            # Render extra tool-level fields
+            tools_section += self._render_extra_keys(tool_def, ["type", "name", "description", "parameters"])
+            tools_section += "\n</function>"
+
+        tools_section += "\n</tools>"
+
+        # Add instruction text per jinja2 template
+        tools_section += (
+            "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+            "<tool_call>\n"
+            "<function=example_function_name>\n"
+            "<parameter=example_parameter_1>\n"
+            "value_1\n"
+            "</parameter>\n"
+            "<parameter=example_parameter_2>\n"
+            "This is the value for the second parameter\n"
+            "that can span\n"
+            "multiple lines\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n\n"
+            "<IMPORTANT>\n"
+            "Reminder:\n"
+            "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+            "- Required parameters MUST be specified\n"
+            "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+            "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+            "</IMPORTANT>"
+        )
+
+        if system_content:
+            return f"{system_content}{tools_section}"
+        # Use default system message when no system content provided (matches jinja2 line 28)
+        return f"{self.DEFAULT_SYSTEM_MESSAGE}{tools_section}"
+
+    def _render_tool_call(self, tool_call: ToolCall | dict) -> str:
         """
         Render a tool call in XML format.
 
@@ -107,8 +265,9 @@ class Qwen3CoderRenderer(Renderer):
             </function>
             </tool_call>
         """
-        function_name = tool_call.function.name
-        arguments = json.loads(tool_call.function.arguments)
+        payload = _tool_call_payload(tool_call)
+        function_name = payload["name"]
+        arguments = payload["arguments"]
 
         result = "\n<tool_call>\n"
         result += f"<function={function_name}>\n"
@@ -127,15 +286,6 @@ class Qwen3CoderRenderer(Renderer):
 
         return result
 
-    @property
-    def _end_message_token(self) -> int:
-        tokens = self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
-        assert len(tokens) == 1, f"Expected single token for <|im_end|>, got {len(tokens)}"
-        return tokens[0]
-
-    def get_stop_sequences(self) -> list[int]:
-        return [self._end_message_token]
-
     def _parse_tool_call(self, tool_call_str: str) -> list[ToolCall] | None:
         """
         Parse a tool call from XML format.
@@ -146,43 +296,42 @@ class Qwen3CoderRenderer(Renderer):
             <parameter=param2>value2</parameter>
             </function>
         """
-        try:
-            # Extract function name from <function=name> tag
-            func_match = re.search(r'<function=([^>]+)>', tool_call_str)
-            if not func_match:
-                return None
-
-            function_name = func_match.group(1)
-
-            # Extract all parameters
-            arguments: dict[str, str] = {}
-            param_pattern = r'<parameter=([^>]+)>\s*(.*?)\s*</parameter>'
-            for param_match in re.finditer(param_pattern, tool_call_str, re.DOTALL):
-                param_name = param_match.group(1)
-                param_value = param_match.group(2).strip()
-
-                # Try to parse as JSON if it looks like JSON
-                if param_value.startswith('{') or param_value.startswith('['):
-                    try:
-                        param_value = json.loads(param_value)
-                    except json.JSONDecodeError:
-                        # Keep as string if JSON parsing fails
-                        pass
-
-                arguments[param_name] = param_value
-
-            # Convert to ToolCall format
-            return [
-                ToolCall(
-                    function=ToolCall.FunctionBody(
-                        name=function_name,
-                        arguments=json.dumps(arguments)
-                    ),
-                    id=None,  # XML format doesn't include IDs
-                )
-            ]
-        except Exception:
+        # Extract function name from <function=name> tag
+        func_match = re.search(r'<function=([^>]+)>', tool_call_str)
+        if not func_match:
             return None
+
+        function_name = func_match.group(1)
+
+        # Extract all parameters
+        arguments: dict[str, str] = {}
+        param_pattern = r'<parameter=([^>]+)>\s*(.*?)\s*</parameter>'
+        for param_match in re.finditer(param_pattern, tool_call_str, re.DOTALL):
+            param_name = param_match.group(1)
+            param_value = param_match.group(2).strip()
+
+            # Try to parse as JSON if it looks like JSON
+            if param_value.startswith('{') or param_value.startswith('['):
+                try:
+                    param_value = json.loads(param_value)
+                except json.JSONDecodeError:
+                    # Keep as string if JSON parsing fails
+                    pass
+
+            arguments[param_name] = param_value
+
+        # Convert to ToolCall format
+        return [
+            ToolCall(
+                function=ToolCall.FunctionBody(
+                    name=function_name,
+                    arguments=json.dumps(arguments)
+                ),
+                id=None,  # XML format doesn't include IDs
+            )
+        ]
+
+
 
     def parse_response(self, response: list[int]) -> tuple[Message, bool]:
         """
@@ -193,6 +342,8 @@ class Qwen3CoderRenderer(Renderer):
         2. Response with tool call in XML format
         3. Malformed response (parse failure)
         """
+        from ..base import parse_response_for_stop_token
+
         assistant_message, parse_success = parse_response_for_stop_token(
             response, self.tokenizer, self._end_message_token
         )

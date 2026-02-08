@@ -252,9 +252,17 @@ class AsyncConfig:
     in_flight_ratio: float = 1.0
 
 
+def compute_warmup_lr(base_lr: float, current_step: int, n_warmup_steps: int) -> float:
+    """Compute learning rate with linear warmup."""
+    if n_warmup_steps <= 0 or current_step >= n_warmup_steps:
+        return base_lr
+    return base_lr * (current_step + 1) / n_warmup_steps
+
+
 @chz.chz
 class Config:
     learning_rate: float
+    n_warmup_steps: int
     dataset_builder: RLDatasetBuilder  # also determines batch size
     model_name: str
     max_tokens: int
@@ -361,9 +369,10 @@ async def do_sync_training_with_stream_minibatch(
     )
 
     for i_batch in range(start_batch, end_batch):
+        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
         metrics = {
             "progress/batch": i_batch,
-            "optim/lr": cfg.learning_rate,
+            "optim/lr": effective_lr,
             "progress/done_frac": (i_batch + 1) / num_batches,
         }
         t_start = time.time()
@@ -584,9 +593,10 @@ async def do_async_training(
                     return False
                 return True
 
+            effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
             metrics = {
                 "training_client/step": i_batch,
-                "optim/lr": cfg.learning_rate,
+                "optim/lr": effective_lr,
                 "progress/done_frac": (i_batch + 1) / num_batches,
             }
             t_start = time.time()
@@ -901,8 +911,9 @@ def _create_producer_consumer(
             wrapped_trajectory_groups = []
 
         # All minibatches enqueued, now enqueue optim_step
+        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
         adam_params = tinker.AdamParams(
-            learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
+            learning_rate=effective_lr, beta1=0.9, beta2=0.95, eps=1e-8
         )
         with timed(f"train/optim_substep_{i_substep}_enqueue", metrics):
             optim_future = await training_client.optim_step_async(adam_params)
@@ -1102,11 +1113,12 @@ async def do_train_step_and_get_sampling_client(
     metrics.update(prepare_minibatch_metrics)
 
     _mark_groups_enqueued(env_group_builders_P)
+    effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
     with timed("train", metrics):
         training_logprobs_D = await train_step(
             data_D,
             training_client,
-            cfg.learning_rate,
+            effective_lr,
             cfg.num_substeps,
             cfg.loss_fn,
             cfg.loss_fn_config,
@@ -1149,9 +1161,10 @@ async def do_sync_training(
     )
 
     for i_batch in range(start_batch, end_batch):
+        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
         metrics = {
             "progress/batch": i_batch,
-            "optim/lr": cfg.learning_rate,
+            "optim/lr": effective_lr,
             "progress/done_frac": (i_batch + 1) / num_batches,
         }
         t_start = time.time()

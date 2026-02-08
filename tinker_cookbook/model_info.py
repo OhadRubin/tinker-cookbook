@@ -49,6 +49,7 @@ def get_qwen_info() -> dict[str, ModelAttributes]:
         "Qwen3-4B-Instruct-2507": ModelAttributes(org, "3", "4B", True),
         "Qwen3-30B-A3B-Instruct-2507": ModelAttributes(org, "3", "30B-A3B", True),
         "Qwen3-235B-A22B-Instruct-2507": ModelAttributes(org, "3", "235B-A22B", True),
+        "Qwen3-Coder-30B-A3B-Instruct": ModelAttributes(org, "3", "30B-A3B", True),
     }
 
 
@@ -106,6 +107,8 @@ def get_recommended_renderer_names(model_name: str) -> list[str]:
         if attributes.version_str == "3":
             if attributes.is_vl:
                 return ["qwen3_vl"]
+            elif "Coder" in model_name:
+                return ["qwen3_coder"]
             elif "-Instruct" in model_name:
                 return ["qwen3_instruct"]
             else:

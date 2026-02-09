@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 from datetime import datetime
 from typing import Any, Dict, cast
 
@@ -104,6 +105,7 @@ class CLIConfig:
     kl_penalty_coef: float = 0.0
     max_concurrent_generation: int = -1
     max_concurrent_scoring: int = -1
+    retry_low_token_trajectories: bool = False
 
     # async training configuration
     async_training: bool = False
@@ -191,7 +193,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         progress = GroupProgress.create(cli_config.group_size)
         builder.progress = progress
 
-        async def run_rollout_with_context(traj_idx: int, rollout_input, max_retries: int = 5):
+        async def run_rollout_with_context(traj_idx: int, rollout_input, max_retries: int = 300):
+            prior_errors = []
             with progress.trajectories[traj_idx].context():
                 set_trajectory_in_progress()
                 result: vf.State | None = None
@@ -201,10 +204,21 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                         rollout_input, shared_client, "tinker", gen_sampling_args, gen_sem
                     )
                     error = result.get("error", None)
+                    if isinstance(error, BaseException) and isinstance(error.__cause__, vf.OverlongPromptError):
+                        log.info("overlong prompt, letting through", component="verifiers_rl",
+                            group_id=progress.group_id, traj_idx=traj_idx, attempt=attempt,
+                            prompt_tokens=str(error.__cause__))
+                        result["error"] = None
+                        result["prompt_too_long"] = True
+                        result["is_truncated"] = True
+                        break
                     if isinstance(error, vf.Error) or error is not None:
                           # TODO: we will consider adding a feature that would check if a lot of trajectories failed and pause everything
                         # or a feature that would reset backoff_seconds according to a switch i could toggle via a file?
-                        log.error("run_rollout_with_context attempt failed", component="verifiers_rl", content=str(error),
+                        error_tb = "".join(traceback.format_exception(error)) if isinstance(error, BaseException) else None
+                        prior_errors.append({"attempt": attempt, "error": repr(error), "traceback": error_tb})
+                        log.error("run_rollout_with_context attempt failed", component="verifiers_rl", content=repr(error),
+                          error_type=type(error).__name__, error_traceback=error_tb,
                           group_id=progress.group_id, traj_idx=traj_idx,
                           attempt=attempt, backoff_seconds=backoff_seconds)
                         if attempt < max_retries - 1:
@@ -216,7 +230,50 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                         )
                         return result
                     token_counts = extract_num_tokens_from_state(result)
-                    set_trajectory_sampled(token_counts.get("total_tokens", 0))
+
+                    last_step_total = token_counts.get("total_tokens", 0)
+
+                    if last_step_total < 3200:
+                        trajectory = result.get("trajectory", [])
+                        steps = []
+                        for step in trajectory:
+                            resp = step.get("response")
+                            usage = getattr(resp, "usage", None) if resp else None
+                            choices = getattr(resp, "choices", []) if resp else []
+                            step_info = {
+                                "finish_reason": choices[0].finish_reason if choices else None,
+                                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                            }
+                            if choices and choices[0].message and choices[0].message.content:
+                                step_info["completion_text"] = choices[0].message.content[:500]
+                            steps.append(step_info)
+
+                        audit = {
+                            "group_id": progress.group_id,
+                            "traj_idx": traj_idx,
+                            "last_step_total": last_step_total,
+                            "num_steps": len(steps),
+                            "reward": result.get("reward"),
+                            "steps": steps,
+                        }
+                        if prior_errors:
+                            audit["prior_errors"] = prior_errors
+                        audit_path = f"/tmp/token_audits/g{progress.group_id}_t{traj_idx}.json"
+                        import os
+                        os.makedirs("/tmp/token_audits", exist_ok=True)
+                        with open(audit_path, "w") as f:
+                            json.dump(audit, f, indent=2)
+                        log.info("trajectory_token_audit_written", component="verifiers_rl",
+                            group_id=progress.group_id, traj_idx=traj_idx, audit_path=audit_path)
+
+                        if cli_config.retry_low_token_trajectories:
+                            log.info("retrying_low_token_trajectory", component="verifiers_rl",
+                                group_id=progress.group_id, traj_idx=traj_idx,
+                                last_step_total=last_step_total, attempt=attempt)
+                            continue
+
+                    set_trajectory_sampled(last_step_total)
                     return result
                 return result
 

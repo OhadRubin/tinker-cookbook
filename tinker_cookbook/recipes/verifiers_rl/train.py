@@ -232,12 +232,12 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                         log.error("all run_rollout_with_context attempts failed", component="verifiers_rl", content=str(error),
                         group_id=progress.group_id, traj_idx=traj_idx
                         )
-                        return result
+                        break
                     token_counts = extract_num_tokens_from_state(result)
 
                     last_step_total = token_counts.get("total_tokens", 0)
 
-                    if last_step_total < 3200:
+                    if last_step_total < 7000:
                         trajectory = result.get("trajectory", [])
                         steps = []
                         for step in trajectory:
@@ -277,8 +277,10 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                                 last_step_total=last_step_total, attempt=attempt)
                             continue
 
-                    set_trajectory_sampled(last_step_total)
-                    return result
+                    break
+                token_counts = extract_num_tokens_from_state(result)
+                last_step_total = token_counts.get("total_tokens", 0)
+                set_trajectory_sampled(last_step_total or progress.trajectories[traj_idx].tokens_generated)
                 return result
 
         with progress.context():

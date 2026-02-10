@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
-from observability import set_group_id, clear_group_id, set_trajectory_id, clear_trajectory_id, get_phase
+from observability import set_group_id, clear_group_id, set_trajectory_id, clear_trajectory_id, register_phase_hook
 
 if TYPE_CHECKING:
     from tinker_cookbook.utils.training_stats import TrainingPipelineStats
@@ -70,6 +70,16 @@ _enabled: bool = False
 _group_size: int = 8
 _num_workers: int | None = None
 _batch_start_time: float | None = None
+
+
+def _on_phase_change(phase: str) -> None:
+    traj = _get_current_trajectory()
+    if traj is None:
+        return
+    traj.phase = phase
+
+
+register_phase_hook(_on_phase_change)
 
 
 # =============================================================================
@@ -280,7 +290,6 @@ def set_trajectory_in_progress() -> None:
         return
     traj.status = TrajectoryStatus.IN_PROGRESS
     traj.start_time = time.time()
-    traj.phase = get_phase()
     _write_progress()
 
 
@@ -297,7 +306,6 @@ def set_trajectory_context(prompt_tokens: int) -> None:
     traj.tokens_generated = prompt_tokens
     traj.last_touched_time = time.time()
     traj.num_llm_calls += 1
-    traj.phase = get_phase()
     _write_progress()
 
 

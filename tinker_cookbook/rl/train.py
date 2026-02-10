@@ -6,6 +6,7 @@ import asyncio
 import io
 import logging
 import os
+import socket
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Coroutine, Iterator, List, Sequence
@@ -293,6 +294,7 @@ class Config:
     eval_every: int = 20  # 0 = disabled
     save_every: int = 20  # 0 = disabled
     load_checkpoint_path: str | None = None
+    checkpoints_gcs_base: str | None = None
 
     async_config: AsyncConfig | None = None
     stream_minibatch_config: StreamMinibatchConfig | None = None
@@ -1275,6 +1277,16 @@ async def main(
     else:
         training_client = await service_client.create_lora_training_client_async(
             cfg.model_name, rank=cfg.lora_rank
+        )
+
+    if cfg.checkpoints_gcs_base:
+        import wandb as _wandb
+        checkpoint_utils.write_run_metadata(
+            checkpoints_gcs_base=cfg.checkpoints_gcs_base,
+            model_id=training_client.model_id,
+            wandb_run_id=_wandb.run.id,
+            wandb_name=cfg.wandb_name,
+            host=socket.gethostname(),
         )
 
     # Get tokenizer from training client

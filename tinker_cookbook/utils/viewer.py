@@ -399,22 +399,18 @@ def watch(capture_file: str | None, max_time_minutes: float | None):
             groups = filtered_groups
 
         table = Table(title="Trajectory Collection", expand=False, box=None)
-        table.add_column("Grp", style="cyan", width=3, no_wrap=True)
+        table.add_column("#", style="cyan", width=3, no_wrap=True)
 
-        # Add 4 columns per trajectory: ctx, rwd, age, status + delimiter
+        # Add 4 columns per trajectory: ctx, rwd, age, status (delimiter folded into st)
         for tid in range(group_size):
-            table.add_column(f"ctx", width=3, justify="right")
-            table.add_column(f"rwd", width=4, justify="right")
+            table.add_column(f"c/k", width=2, justify="right")
+            table.add_column(f"rwd", width=3, justify="right")
             table.add_column(f"age", width=3, justify="right")
-            table.add_column(f"st", width=1, justify="center")
-            if tid < group_size - 1:
-                table.add_column("", width=1)  # delimiter column
+            table.add_column(f"st", width=3, justify="center")
 
         table.add_column("Done", width=5, justify="right")
         table.add_column("μRwd", width=5, justify="right")
         table.add_column("Time", width=5, justify="right")
-        table.add_column("Min", width=3, justify="right")
-        table.add_column("Max", width=3, justify="right")
 
         # First pass: compute mean rewards for all groups
         group_mean_rewards: dict[str, float | None] = {}
@@ -468,16 +464,32 @@ def watch(capture_file: str | None, max_time_minutes: float | None):
             group_training_status = group.get("training_status", "pending")
             has_enqueued = group_training_status == "enqueued"
 
-            row: list[str | Text] = [f"G{int(gid):02d}"]
+            row: list[str | Text] = [f"{int(gid):3d}"]
             completed = 0
+
+            # Precompute ages to find the max for red highlighting
+            traj_ages: dict[int, int | None] = {}
+            for tid in range(group_size):
+                traj = trajectories.get(str(tid), trajectories.get(tid, {}))
+                status = traj.get("status", "pending")
+                et = traj.get("end_time")
+                lt = traj.get("last_touched_time")
+                if group_training_status in ("enqueued", "done") or status == "sampled":
+                    traj_ages[tid] = None
+                elif et:
+                    traj_ages[tid] = int(now - et)
+                elif lt:
+                    traj_ages[tid] = int(now - lt)
+                else:
+                    traj_ages[tid] = None
+            visible_ages = [a for a in traj_ages.values() if a is not None]
+            max_age = max(visible_ages) if visible_ages else None
 
             for tid in range(group_size):
                 traj = trajectories.get(str(tid), trajectories.get(tid, {}))
                 status = traj.get("status", "pending")
                 tokens = traj.get("tokens_generated", 0)
                 reward = traj.get("reward")
-                end_time = traj.get("end_time")
-                last_touched_time = traj.get("last_touched_time")
 
                 # Context length in k
                 k = tokens // 1000
@@ -485,52 +497,56 @@ def watch(capture_file: str | None, max_time_minutes: float | None):
                 # Reward and context styling based on status
                 if status == "completed":
                     completed += 1
-                    ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
+                    ctx_text = Text(f"{k:2d}" if k > 0 else " ·", style="white bold")
                     if reward is not None:
                         is_top3 = reward > 0 and reward >= top3_threshold
                         rwd_style = "bright_green" if is_top3 else "yellow"
-                        rwd_text = Text(f"{reward:+.1f}" if reward != 0 else " 0.0", style=rwd_style)
+                        rwd_text = Text(f"{reward:.1f}" if reward != 0 else "0.0", style=rwd_style)
                     else:
-                        rwd_text = Text("   ?", style="yellow")
+                        rwd_text = Text("  ?", style="yellow")
                 elif status == "sampled":
                     completed += 1  # count as completed for Done column
-                    ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
-                    rwd_text = Text("   ·", style="dim")
+                    ctx_text = Text(f"{k:2d}" if k > 0 else " ·", style="white bold")
+                    rwd_text = Text("  ·", style="dim")
                 elif status == "in_progress":
-                    ctx_text = Text(f"{k:2d}k" if k > 0 else "  ·", style="white bold")
-                    rwd_text = Text("   ·", style="dim")
+                    ctx_text = Text(f"{k:2d}" if k > 0 else " ·", style="white bold")
+                    rwd_text = Text("  ·", style="dim")
                 else:
-                    ctx_text = Text("  ·", style="dim")
-                    rwd_text = Text("   ·", style="dim")
+                    ctx_text = Text(" ·", style="dim")
+                    rwd_text = Text("  ·", style="dim")
 
                 # Time since last activity (age in seconds)
-                # Hide individual ages when enqueued/done (all same, shown in Min/Max instead)
-                if group_training_status in ("enqueued", "done") or status == "sampled":
+                age = traj_ages[tid]
+                if age is None:
                     age_text = Text("  ·", style="dim")
-                elif end_time:
-                    age = int(now - end_time)
-                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="dim")
-                elif last_touched_time:
-                    age = int(now - last_touched_time)
-                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style="dim")
                 else:
-                    age_text = Text("  ·", style="dim")
+                    is_max = max_age is not None and age == max_age and len(visible_ages) > 1
+                    age_style = "red bold" if is_max else "dim"
+                    age_text = Text(f"{age:3d}" if age < 1000 else "999", style=age_style)
 
                 # Training status (per-group) combined with sampling status (per-traj)
+                phase = traj.get("phase")
                 if group_training_status == "done":
-                    st_text = Text("D", style="bright_cyan bold")
+                    st_text = Text(" D", style="bright_cyan bold")
                 elif group_training_status == "enqueued":
-                    st_text = Text("R", style="red bold")
+                    st_text = Text(" R", style="red bold")
                 elif status == "sampled":
-                    st_text = Text("W", style="bright_magenta bold")
+                    st_text = Text(" W", style="bright_magenta bold")
                 elif status == "completed":
-                    st_text = Text("C", style="yellow bold")
+                    st_text = Text(" C", style="yellow bold")
+                elif phase == "policy_before":
+                    st_text = Text("Pb", style="green bold")
+                elif phase == "policy_after":
+                    st_text = Text("Pa", style="green")
+                elif phase == "env_before":
+                    st_text = Text("Eb", style="bright_yellow bold")
+                elif phase == "env_after":
+                    st_text = Text("Ea", style="bright_yellow")
                 else:
-                    st_text = Text("S", style="green")
+                    st_text = Text(" S", style="green")
 
+                st_text.append("│", style="dim")
                 row.extend([ctx_text, rwd_text, age_text, st_text])
-                if tid < group_size - 1:
-                    row.append(Text("│", style="dim"))
 
             # Global columns
             total = len(trajectories) if trajectories else group_size
@@ -551,22 +567,6 @@ def watch(capture_file: str | None, max_time_minutes: float | None):
                 row.append(Text("--", style="dim"))
             row.append(time_str)
 
-            # Min/Max age across all trajectories (including W/sampled)
-            ages = []
-            for t in range(group_size):
-                traj = trajectories.get(str(t), trajectories.get(t, {}))
-                traj_end = traj.get("end_time")
-                traj_last = traj.get("last_touched_time")
-                ref_time = traj_end or traj_last
-                if ref_time:
-                    ages.append(int(now - ref_time))
-
-            if ages:
-                row.append(Text(f"{min(ages):3d}", style="white"))
-                row.append(Text(f"{max(ages):3d}", style="white"))
-            else:
-                row.append(Text("  ·", style="dim"))
-                row.append(Text("  ·", style="dim"))
 
             table.add_row(*row)
 

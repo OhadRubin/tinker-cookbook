@@ -120,6 +120,10 @@ class CLIConfig:
     # data filtering
     remove_constant_reward_groups: bool  # Filter out groups where all trajectories have same reward (zero advantage)
 
+    # checkpoint resume
+    load_checkpoint_path: str | None = None
+    checkpoints_gcs_base: str | None = None
+
     # .ging configuration
     eval_every: int = 0
     save_every: int = 10
@@ -343,6 +347,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
             num_minibatches=cli_config.groups_per_batch,
         ),
         base_url=cli_config.base_url,
+        load_checkpoint_path=cli_config.load_checkpoint_path,
+        checkpoints_gcs_base=cli_config.checkpoints_gcs_base,
     )
 
     await train.main(cfg)

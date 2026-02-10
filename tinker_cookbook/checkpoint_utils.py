@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import socket
+import tempfile
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import tinker
@@ -84,6 +87,36 @@ async def save_checkpoint_async(
         f.write(json.dumps(full_dict) + "\n")
 
     return paths
+
+
+def write_run_metadata(
+    checkpoints_gcs_base: str,
+    model_id: str,
+    wandb_run_id: str,
+    wandb_name: str,
+    host: str,
+) -> None:
+    metadata = {
+        "model_id": model_id,
+        "wandb_run_id": wandb_run_id,
+        "wandb_name": wandb_name,
+        "host": host,
+        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    model_dir = os.path.join(checkpoints_gcs_base, model_id)
+    os.makedirs(model_dir, exist_ok=True)
+    target = os.path.join(model_dir, "run_metadata.json")
+
+    fd, tmp_path = tempfile.mkstemp(dir=model_dir, suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(metadata, f, indent=2)
+            f.write("\n")
+        os.rename(tmp_path, target)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+    logger.info(f"Wrote run metadata to {target}")
 
 
 @scope

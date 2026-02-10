@@ -21,6 +21,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
+from observability import set_group_id, clear_group_id, set_trajectory_id, clear_trajectory_id, get_phase
+
 if TYPE_CHECKING:
     from tinker_cookbook.utils.training_stats import TrainingPipelineStats
 
@@ -118,14 +120,19 @@ class TrajectoryProgress:
     end_time: float | None = None
     last_touched_time: float | None = None
     num_llm_calls: int = 0
+    phase: str | None = None
 
     @contextmanager
     def context(self) -> Iterator[TrajectoryProgress]:
         """Sets this as current trajectory on enter, clears on exit."""
         token = _current_trajectory.set(self)
+        set_group_id(self.group_id)
+        set_trajectory_id(self.trajectory_id)
         try:
             yield self
         finally:
+            clear_trajectory_id()
+            clear_group_id()
             _current_trajectory.reset(token)
 
     def to_dict(self) -> dict:
@@ -140,6 +147,7 @@ class TrajectoryProgress:
             "end_time": self.end_time,
             "last_touched_time": self.last_touched_time,
             "num_llm_calls": self.num_llm_calls,
+            "phase": self.phase,
         }
 
 
@@ -174,6 +182,7 @@ class GroupProgress:
     def context(self) -> Iterator[GroupProgress]:
         """Registers group on enter, unregisters on exit."""
         self.start_time = time.time()
+        set_group_id(self.group_id)
         _register_group(self)
         if _enabled:
             _get_training_stats().sampling_started_sync()
@@ -186,6 +195,7 @@ class GroupProgress:
             if _enabled and self.start_time is not None:
                 latency_ms = (self.end_time - self.start_time) * 1000
                 _get_training_stats().sampling_completed_sync(latency_ms)
+            clear_group_id()
 
     def to_dict(self) -> dict:
         """JSON serialization for watch() display."""
@@ -270,6 +280,7 @@ def set_trajectory_in_progress() -> None:
         return
     traj.status = TrajectoryStatus.IN_PROGRESS
     traj.start_time = time.time()
+    traj.phase = get_phase()
     _write_progress()
 
 
@@ -286,6 +297,7 @@ def set_trajectory_context(prompt_tokens: int) -> None:
     traj.tokens_generated = prompt_tokens
     traj.last_touched_time = time.time()
     traj.num_llm_calls += 1
+    traj.phase = get_phase()
     _write_progress()
 
 

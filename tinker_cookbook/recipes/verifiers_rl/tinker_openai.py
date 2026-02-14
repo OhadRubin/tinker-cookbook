@@ -270,20 +270,6 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
 
             max_completion_tokens = int(max_completion_tokens or 128)
             total_tokens = len(prompt_token_ids) + max_completion_tokens
-            # if total_tokens > self._parent.max_context_length:
-            #     log.error(
-            #         "Request exceeds max context length",
-            #         component="client",
-            #         prompt_tokens=len(prompt_token_ids),
-            #         max_completion_tokens=max_completion_tokens,
-            #         total_tokens=total_tokens,
-            #         max_context_length=self._parent.max_context_length,
-            #     )
-            #     raise vf.OverlongPromptError(
-            #         f"Request exceeds max context length: "
-            #         f"{len(prompt_token_ids)} prompt tokens + {max_completion_tokens} max_completion_tokens = "
-            #         f"{total_tokens} > {self._parent.max_context_length}"
-            #     )
             if total_tokens > self._parent.max_context_length:
                 max_completion_tokens = self._parent.max_context_length - len(prompt_token_ids) - 3
                 if max_completion_tokens <= 0:
@@ -414,12 +400,6 @@ class TinkerCompletions(OpenAIAsyncCompletions):
                     f"{self._parent.max_context_length} max context length"
                 )
 
-        # if total_tokens > self._parent.max_context_length:
-        #     raise vf.OverlongPromptError(
-        #         f"Request exceeds max context length: "
-        #         f"{len(prompt_token_ids)} prompt tokens + {max_completion_tokens} max_completion_tokens = "
-        #         f"{total_tokens} > {self._parent.max_context_length}"
-        #     )
 
         sample = await sample_with_retries(
             self._parent.sampling_client,

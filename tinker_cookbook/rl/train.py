@@ -285,6 +285,7 @@ class Config:
 
     wandb_project: str | None = None
     wandb_name: str | None = None
+    vf_env_id: str | None = None
 
     log_path: str = chz.field(munger=lambda _, s: os.path.expanduser(s))
     base_url: str | None = None
@@ -726,6 +727,11 @@ async def save_checkpoint_and_get_sampling_client(
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     metrics = {}
     with timed("save_checkpoint", metrics):
+        # Save rolling training state every step for preemption resilience
+        latest_future = await training_client.save_state_async(
+            f"{checkpoint_utils.LATEST_PREFIX}{i_batch:06d}"
+        )
+
         if save_every > 0 and i_batch > start_batch and i_batch % save_every == 0:
             path_dict = await checkpoint_utils.save_checkpoint_async(
                 training_client=training_client,
@@ -734,9 +740,12 @@ async def save_checkpoint_and_get_sampling_client(
                 loop_state={"batch": i_batch},
                 kind="both",
             )
+            await latest_future.result_async()
             return training_client.create_sampling_client(path_dict["sampler_path"]), metrics
         else:
-            return await training_client.save_weights_and_get_sampling_client_async(), metrics
+            sampling_client = await training_client.save_weights_and_get_sampling_client_async()
+            await latest_future.result_async()
+            return sampling_client, metrics
 
 
 @scope
@@ -1253,6 +1262,9 @@ async def main(
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("pylatexenc").setLevel(logging.WARNING)
 
+    if cfg.wandb_name and cfg.checkpoints_gcs_base:
+        checkpoint_utils.reconstruct_checkpoints_from_gcs(cfg.log_path, cfg.wandb_name)
+
     resume_info = checkpoint_utils.get_last_checkpoint(cfg.log_path)
     if resume_info:
         start_batch = resume_info["batch"]
@@ -1286,8 +1298,17 @@ async def main(
             model_id=training_client.model_id,
             wandb_run_id=_wandb.run.id,
             wandb_name=cfg.wandb_name,
+            wandb_project=cfg.wandb_project,
+            base_model=cfg.model_name,
+            lora_rank=cfg.lora_rank,
+            env_name=cfg.vf_env_id,
             host=socket.gethostname(),
+            job_file=os.environ["JOB_FILE"],
         )
+
+    # Pre-download tokenizer (handles corrupt cache by forcing re-download)
+    from tinker_cookbook.rl.ensure_tokenizer import ensure_tokenizer
+    ensure_tokenizer(cfg.model_name)
 
     # Get tokenizer from training client
     tokenizer = training_client.get_tokenizer()

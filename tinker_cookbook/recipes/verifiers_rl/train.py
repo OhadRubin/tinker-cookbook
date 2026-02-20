@@ -130,7 +130,7 @@ class CLIConfig:
     log_path: str | None = None
     wandb_project: str | None = None
     wandb_name: str | None = None
-    behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
+    behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "resume"
 
 
 async def cli_main(cli_config: CLIConfig, env: Any | None):
@@ -227,7 +227,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
                 token_counts = extract_num_tokens_from_state(result)
                 last_step_total = token_counts.get("total_tokens", 0)
 
-                if last_step_total < 7000:
+                if last_step_total < (cli_config.max_context_length)/2:
                     trajectory = result.get("trajectory", [])
                     steps = []
                     for step in trajectory:
@@ -353,6 +353,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         num_substeps=cli_config.num_substeps,
         wandb_project=cli_config.wandb_project,
         wandb_name=cli_config.wandb_name or run_name,
+        vf_env_id=cli_config.vf_env_id,
         log_path=log_path,
         eval_every=cli_config.eval_every,
         save_every=cli_config.save_every,

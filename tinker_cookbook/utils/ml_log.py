@@ -1,5 +1,6 @@
 """Simplified logging utilities for tinker-cookbook."""
 
+import hashlib
 import json
 import logging
 import os
@@ -217,11 +218,15 @@ class WandbLogger(Logger):
 
         # Initialize wandb run
         assert wandb is not None  # For type checker
+        run_id = hashlib.md5(wandb_name.encode()).hexdigest()[:8] if wandb_name else None
         self.run = wandb.init(
             project=project,
             config=dump_config(config) if config else None,
             dir=str(log_dir) if log_dir else None,
             name=wandb_name,
+            id=run_id,
+            resume="allow",
+            # settings=wandb.Settings(start_method="thread"),
         )
 
     def log_hparams(self, config: Any) -> None:

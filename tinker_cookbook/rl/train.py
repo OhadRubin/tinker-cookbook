@@ -17,6 +17,7 @@ import tinker
 import torch
 from tinker.lib.public_interfaces import APIFuture
 from tinker.types import LossFnType
+import metadata_helpers
 from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.completers import TinkerTokenCompleter
 from tinker_cookbook.display import colorize_example
@@ -76,6 +77,46 @@ def _get_evaluator_name(evaluator: SamplingClientEvaluator) -> str:
         else ""
     )
 
+
+async def monitor_event_loop_lag(
+    env_queue: asyncio.Queue,
+    traj_queue: asyncio.Queue,
+    report_interval_s: float,
+    sample_interval_s: float,
+):
+    """Reports event loop lag distribution periodically.
+
+    See ~/tinker-self-hosting/event_loop_lag_suspects.md for known causes of high lag.
+    """
+    lags: list[float] = []
+    last_report = time.monotonic()
+
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(0)
+        lag_ms = (time.monotonic() - t0) * 1000
+        lags.append(lag_ms)
+
+        now = time.monotonic()
+        if now - last_report >= report_interval_s and lags:
+            sorted_lags = sorted(lags)
+            n = len(sorted_lags)
+
+            log.info("loop_health_report",
+                component="loop_monitor",
+                samples=n,
+                lag_p50_ms=round(sorted_lags[n // 2], 2),
+                lag_p95_ms=round(sorted_lags[int(n * 0.95)], 2),
+                lag_p99_ms=round(sorted_lags[int(n * 0.99)], 2),
+                lag_max_ms=round(sorted_lags[-1], 2),
+                pending_tasks=len(asyncio.all_tasks()),
+                env_queue_size=env_queue.qsize(),
+                traj_queue_size=traj_queue.qsize())
+
+            lags.clear()
+            last_report = now
+
+        await asyncio.sleep(sample_interval_s)
 
 @contextmanager
 def _get_logtree_scope(
@@ -693,6 +734,15 @@ async def do_async_training(
         ],
         asyncio.create_task(training_loop(), name="training_loop"),
         asyncio.create_task(evaluation_loop(), name="evaluation_loop"),
+        asyncio.create_task(
+            monitor_event_loop_lag(
+                env_queue=env_group_builders_queue,
+                traj_queue=trajectory_groups_queue,
+                report_interval_s=180,
+                sample_interval_s=0.5,
+            ),
+            name="loop_monitor",
+        ),
     )
 
 
@@ -729,7 +779,7 @@ async def save_checkpoint_and_get_sampling_client(
     with timed("save_checkpoint", metrics):
         # Save rolling training state every step for preemption resilience
         latest_future = await training_client.save_state_async(
-            f"{checkpoint_utils.LATEST_PREFIX}{i_batch:06d}"
+            f"{metadata_helpers.LATEST_PREFIX}{i_batch:06d}"
         )
 
         if save_every > 0 and i_batch > start_batch and i_batch % save_every == 0:
@@ -1263,7 +1313,7 @@ async def main(
     logging.getLogger("pylatexenc").setLevel(logging.WARNING)
 
     if cfg.wandb_name and cfg.checkpoints_gcs_base:
-        checkpoint_utils.reconstruct_checkpoints_from_gcs(cfg.log_path, cfg.wandb_name)
+        metadata_helpers.reconstruct_checkpoints_from_gcs(cfg.log_path, cfg.wandb_name)
 
     resume_info = checkpoint_utils.get_last_checkpoint(cfg.log_path)
     if resume_info:
@@ -1293,7 +1343,7 @@ async def main(
 
     if cfg.checkpoints_gcs_base:
         import wandb as _wandb
-        checkpoint_utils.write_run_metadata(
+        metadata_helpers.write_run_metadata(
             checkpoints_gcs_base=cfg.checkpoints_gcs_base,
             model_id=training_client.model_id,
             wandb_run_id=_wandb.run.id,

@@ -226,7 +226,10 @@ class WandbLogger(Logger):
             name=wandb_name,
             id=run_id,
             resume="allow",
-            # settings=wandb.Settings(start_method="thread"),
+            settings=wandb.Settings(
+                # start_method="thread",
+                console="off"
+                ),
         )
 
     def log_hparams(self, config: Any) -> None:

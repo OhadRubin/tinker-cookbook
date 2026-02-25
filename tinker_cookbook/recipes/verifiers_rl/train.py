@@ -36,6 +36,23 @@ from tinker_cookbook.utils.trajectory_progress import (
 class NoTokensError(Exception):
     pass
 
+
+class RolloutError(Exception):
+    """Wrapper for errors that occur during rollout."""
+    def __init__(self, traj_idx: int, error: BaseException, result: vf.State):
+        self.traj_idx = traj_idx
+        self.error = error
+        self.result = result
+        super().__init__(f"Rollout failed for trajectory {traj_idx}: {error!r}")
+
+
+class LowTokensRetry(Exception):
+    """Signal to retry due to low token count."""
+    def __init__(self, traj_idx: int, result: vf.State):
+        self.traj_idx = traj_idx
+        self.result = result
+        super().__init__(f"Low tokens for trajectory {traj_idx}")
+
 def extract_num_tokens_from_state(state: vf.State) -> Dict[str, int]:
     """Extract token counts from the last step in trajectory.
 
@@ -75,6 +92,156 @@ def extract_num_tokens_from_state(state: vf.State) -> Dict[str, int]:
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
+
+
+def _build_low_token_audit(progress, traj_idx: int, result: vf.State, last_step_total: int, prior_errors: list[dict] | None = None) -> dict:
+    """Build audit dict for low-token trajectories."""
+    trajectory = result.get("trajectory", [])
+    steps = []
+    for step in trajectory:
+        resp = step.get("response")
+        usage = getattr(resp, "usage", None) if resp else None
+        choices = getattr(resp, "choices", []) if resp else []
+        step_info = {
+            "finish_reason": choices[0].finish_reason if choices else None,
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        }
+        if choices and choices[0].message and choices[0].message.content:
+            step_info["completion_text"] = choices[0].message.content[:500]
+        steps.append(step_info)
+
+    audit = {
+        "group_id": progress.group_id,
+        "traj_idx": traj_idx,
+        "last_step_total": last_step_total,
+        "num_steps": len(steps),
+        "reward": result.get("reward"),
+        "steps": steps,
+    }
+    if prior_errors:
+        audit["prior_errors"] = prior_errors
+    return audit
+
+
+def _write_audit(audit: dict, progress, traj_idx: int):
+    """Write audit to file."""
+    import os
+    audit_path = f"/tmp/token_audits/g{progress.group_id}_t{traj_idx}.json"
+    os.makedirs("/tmp/token_audits", exist_ok=True)
+    with open(audit_path, "w") as f:
+        json.dump(audit, f, indent=2)
+    log.info("trajectory_token_audit_written", component="verifiers_rl",
+        group_id=progress.group_id, traj_idx=traj_idx, audit_path=audit_path)
+
+
+def create_single_rollout_attempt(
+    vf_builder: VerifiersEnvGroupBuilder,
+    shared_client: TinkerAsyncOpenAIClient,
+    gen_sampling_args: dict,
+    gen_sem: asyncio.Semaphore | None,
+    progress: GroupProgress,
+    cli_config: CLIConfig,
+):
+    """
+    Creates a function that performs a SINGLE rollout attempt.
+    Raises RolloutError or LowTokensRetry on failure, returns result on success.
+    """
+    async def single_rollout_attempt(traj_idx: int, rollout_input) -> vf.State:
+        result = await vf_builder.vf_env.run_rollout(
+            rollout_input, shared_client, "tinker", gen_sampling_args, gen_sem
+        )
+        error = result.get("error", None)
+
+        if isinstance(error, BaseException) and isinstance(error.__cause__, vf.OverlongPromptError):
+            log.info("overlong prompt, letting through", component="verifiers_rl",
+                group_id=progress.group_id, traj_idx=traj_idx,
+                prompt_tokens=str(error.__cause__))
+            result["error"] = None
+            result["prompt_too_long"] = True
+            result["is_truncated"] = True
+            return result
+
+        if isinstance(error, vf.Error) or error is not None:
+            raise RolloutError(traj_idx, error, result)
+
+        token_counts = extract_num_tokens_from_state(result)
+        last_step_total = token_counts.get("total_tokens", 0)
+
+        if last_step_total < (cli_config.max_context_length) / 2:
+            if cli_config.retry_low_token_trajectories:
+                raise LowTokensRetry(traj_idx, result)
+            audit = _build_low_token_audit(progress, traj_idx, result, last_step_total)
+            _write_audit(audit, progress, traj_idx)
+
+        return result
+
+    return single_rollout_attempt
+
+
+def create_trajectory_runner(
+    single_attempt,
+    progress: GroupProgress,
+    max_retries: int,
+):
+    """
+    Creates a function that runs a trajectory with retries.
+    Each trajectory gets its own independent retry loop with backoff.
+    """
+    async def run_trajectory_with_retries(traj_idx: int, rollout_input) -> tuple[int, vf.State]:
+        prior_errors: list[dict] = []
+        backoff_seconds = 1.0
+
+        with progress.trajectories[traj_idx].context():
+            set_trajectory_in_progress()
+
+            for attempt in range(max_retries):
+                try:
+                    result = await single_attempt(traj_idx, rollout_input)
+                    token_counts = extract_num_tokens_from_state(result)
+                    set_trajectory_sampled(token_counts.get("total_tokens", 0) or progress.trajectories[traj_idx].tokens_generated)
+                    return traj_idx, result
+
+                except RolloutError as e:
+                    error_tb = "".join(traceback.format_exception(e.error)) if isinstance(e.error, BaseException) else None
+                    error_info = {"attempt": attempt, "error": repr(e.error), "traceback": error_tb}
+                    prior_errors.append(error_info)
+
+                    if attempt >= max_retries - 1:
+                        log.error("all attempts failed", component="verifiers_rl",
+                            content=error_info["error"], group_id=progress.group_id, traj_idx=traj_idx)
+                        token_counts = extract_num_tokens_from_state(e.result)
+                        set_trajectory_sampled(token_counts.get("total_tokens", 0) or progress.trajectories[traj_idx].tokens_generated)
+                        return traj_idx, e.result
+
+                    log.error("rollout attempt failed", component="verifiers_rl",
+                        content=error_info["error"],
+                        error_type=type(e.error).__name__,
+                        error_traceback=error_tb,
+                        group_id=progress.group_id, traj_idx=traj_idx,
+                        attempt=attempt, backoff_seconds=backoff_seconds)
+                    await asyncio.sleep(backoff_seconds)
+                    backoff_seconds *= 1.1
+
+                except LowTokensRetry as e:
+                    token_counts = extract_num_tokens_from_state(e.result)
+                    last_step_total = token_counts.get("total_tokens", 0)
+                    audit = _build_low_token_audit(progress, e.traj_idx, e.result, last_step_total, prior_errors if prior_errors else None)
+                    _write_audit(audit, progress, e.traj_idx)
+
+                    if attempt >= max_retries - 1:
+                        log.warning("low token trajectory exhausted retries, accepting result",
+                            component="verifiers_rl", group_id=progress.group_id, traj_idx=traj_idx)
+                        token_counts = extract_num_tokens_from_state(e.result)
+                        set_trajectory_sampled(token_counts.get("total_tokens", 0) or progress.trajectories[traj_idx].tokens_generated)
+                        return traj_idx, e.result
+
+                    log.info("retrying low token trajectory", component="verifiers_rl",
+                        group_id=progress.group_id, traj_idx=traj_idx, attempt=attempt)
+
+            raise AssertionError(f"unreachable: trajectory {traj_idx} exhausted {max_retries} retries without returning")
+
+    return run_trajectory_with_retries
 
 
 @chz.chz
@@ -197,117 +364,26 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         progress = GroupProgress.create(cli_config.group_size)
         builder.progress = progress
 
-        async def run_rollout_with_context(traj_idx: int, rollout_input, max_retries: int = 300):
-            prior_errors = []
+        single_attempt = create_single_rollout_attempt(
+            vf_builder, shared_client, gen_sampling_args, gen_sem, progress, cli_config
+        )
 
-            async def _single_attempt(attempt: int) -> tuple[str, vf.State, dict | None]:
-                result = await vf_builder.vf_env.run_rollout(
-                    rollout_input, shared_client, "tinker", gen_sampling_args, gen_sem
-                )
-                error = result.get("error", None)
+        max_retries = 300
+        states: list[vf.State | None] = [None] * len(rollout_inputs)
 
-                if isinstance(error, BaseException) and isinstance(error.__cause__, vf.OverlongPromptError):
-                    log.info("overlong prompt, letting through", component="verifiers_rl",
-                        group_id=progress.group_id, traj_idx=traj_idx, attempt=attempt,
-                        prompt_tokens=str(error.__cause__))
-                    result["error"] = None
-                    result["prompt_too_long"] = True
-                    result["is_truncated"] = True
-                    return "success", result, None
-
-                if isinstance(error, vf.Error) or error is not None:
-                    # TODO: we will consider adding a feature that would check if a lot of trajectories failed and pause everything
-                    # or a feature that would reset backoff_seconds according to a switch i could toggle via a file?
-                    error_tb = "".join(traceback.format_exception(error)) if isinstance(error, BaseException) else None
-                    error_info = {"attempt": attempt, "error": repr(error), "traceback": error_tb}
-                    if attempt >= max_retries - 1:
-                        return "exhausted", result, error_info
-                    return "retry_error", result, error_info
-
-                token_counts = extract_num_tokens_from_state(result)
-                last_step_total = token_counts.get("total_tokens", 0)
-
-                if last_step_total < (cli_config.max_context_length)/2:
-                    trajectory = result.get("trajectory", [])
-                    steps = []
-                    for step in trajectory:
-                        resp = step.get("response")
-                        usage = getattr(resp, "usage", None) if resp else None
-                        choices = getattr(resp, "choices", []) if resp else []
-                        step_info = {
-                            "finish_reason": choices[0].finish_reason if choices else None,
-                            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                        }
-                        if choices and choices[0].message and choices[0].message.content:
-                            step_info["completion_text"] = choices[0].message.content[:500]
-                        steps.append(step_info)
-
-                    audit = {
-                        "group_id": progress.group_id,
-                        "traj_idx": traj_idx,
-                        "last_step_total": last_step_total,
-                        "num_steps": len(steps),
-                        "reward": result.get("reward"),
-                        "steps": steps,
-                    }
-                    if prior_errors:
-                        audit["prior_errors"] = prior_errors
-                    audit_path = f"/tmp/token_audits/g{progress.group_id}_t{traj_idx}.json"
-                    import os
-                    os.makedirs("/tmp/token_audits", exist_ok=True)
-                    with open(audit_path, "w") as f:
-                        json.dump(audit, f, indent=2)
-                    log.info("trajectory_token_audit_written", component="verifiers_rl",
-                        group_id=progress.group_id, traj_idx=traj_idx, audit_path=audit_path)
-
-                    if cli_config.retry_low_token_trajectories:
-                        return "retry_low_tokens", result, None
-
-                return "success", result, None
-
-            with progress.trajectories[traj_idx].context():
-                set_trajectory_in_progress()
-                result: vf.State | None = None
-                backoff_seconds = 1
-
-                for attempt in range(max_retries):
-                    outcome, result, error_info = await _single_attempt(attempt)
-
-                    match outcome:
-                        case "success":
-                            break
-                        case "retry_error":
-                            prior_errors.append(error_info)
-                            log.error("run_rollout_with_context attempt failed", component="verifiers_rl", content=error_info["error"],
-                                error_type=type(result.get("error")).__name__ if result.get("error") else "Unknown",
-                                error_traceback=error_info["traceback"],
-                                group_id=progress.group_id, traj_idx=traj_idx,
-                                attempt=attempt, backoff_seconds=backoff_seconds)
-                            await asyncio.sleep(backoff_seconds)
-                            backoff_seconds *= 1.1
-                        case "retry_low_tokens":
-                            log.info("retrying_low_token_trajectory", component="verifiers_rl",
-                                group_id=progress.group_id, traj_idx=traj_idx,
-                                attempt=attempt)
-                        case "exhausted":
-                            prior_errors.append(error_info)
-                            log.error("all run_rollout_with_context attempts failed", component="verifiers_rl", content=error_info["error"],
-                                group_id=progress.group_id, traj_idx=traj_idx)
-                            break
-                        case _:
-                            raise ValueError(f"unexpected outcome: {outcome}")
-
-                token_counts = extract_num_tokens_from_state(result)
-                last_step_total = token_counts.get("total_tokens", 0)
-                set_trajectory_sampled(last_step_total or progress.trajectories[traj_idx].tokens_generated)
-                return result
+        run_trajectory_with_retries = create_trajectory_runner(
+            single_attempt, progress, max_retries
+        )
 
         with progress.context():
-            states = list(await asyncio.gather(*[
-                run_rollout_with_context(i, inp)
+            tasks = [
+                asyncio.create_task(run_trajectory_with_retries(i, inp))
                 for i, inp in enumerate(rollout_inputs)
-            ]))
+            ]
+
+            for coro in asyncio.as_completed(tasks):
+                traj_idx, result = await coro
+                states[traj_idx] = result
 
             await vf_builder.vf_env.rubric.score_group(states, score_sem=score_sem)
 

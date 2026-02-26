@@ -55,6 +55,26 @@ from observability import log, bootstrap, set_run_id, Events
 
 MAX_MINUTES_TO_RUN_GROUP = 30
 
+class TrainLoopCallbacks:
+    """Holds optional callbacks for the training loop (e.g., curriculum hooks).
+
+    Class attributes are intentional: this is a singleton accessed via the module-level
+    `train_loop_callbacks` instance. Recipes override these callbacks at module load time.
+
+    Callbacks:
+        on_batch_complete(metrics: dict) — called after each training step with the step metrics
+        on_checkpoint_save(model_id: str) — called after checkpoint is saved
+        on_checkpoint_restore(batch: int, model_id: str | None) — called on resume; model_id is
+            None if starting fresh (no checkpoint to restore)
+    """
+
+    on_batch_complete: Callable[[dict], None] = lambda _: None
+    on_checkpoint_save: Callable[[str], None] = lambda _: None
+    on_checkpoint_restore: Callable[[int, str | None], None] = lambda _b, _m: None
+
+
+train_loop_callbacks = TrainLoopCallbacks()
+
 
 def _mark_groups_enqueued(env_group_builders: Sequence[EnvGroupBuilder]) -> None:
     """Mark all groups as enqueued for training."""
@@ -791,10 +811,12 @@ async def save_checkpoint_and_get_sampling_client(
                 kind="both",
             )
             await latest_future.result_async()
+            train_loop_callbacks.on_checkpoint_save(training_client.model_id)
             return training_client.create_sampling_client(path_dict["sampler_path"]), metrics
         else:
             sampling_client = await training_client.save_weights_and_get_sampling_client_async()
             await latest_future.result_async()
+            train_loop_callbacks.on_checkpoint_save(training_client.model_id)
             return sampling_client, metrics
 
 
@@ -1146,6 +1168,9 @@ async def do_train_step_streaming_and_get_sampling_client(
         cfg.compute_post_kl,
     )
     metrics.update(full_batch_metrics)
+
+    train_loop_callbacks.on_batch_complete(metrics)
+
     return sampling_client, metrics
 
 
@@ -1198,6 +1223,8 @@ async def do_train_step_and_get_sampling_client(
         cfg.compute_post_kl,
     )
     metrics.update(full_batch_metrics)
+
+    train_loop_callbacks.on_batch_complete(metrics)
 
     return sampling_client, metrics
 
@@ -1318,8 +1345,11 @@ async def main(
     resume_info = checkpoint_utils.get_last_checkpoint(cfg.log_path)
     if resume_info:
         start_batch = resume_info["batch"]
+        # state_path format: "tinker://model_xxx/weights/checkpoint_name" → [2] extracts model_id
+        resume_model_id = resume_info["state_path"].split("/")[2]
     else:
         start_batch = 0
+        resume_model_id = None
 
     service_client = tinker.ServiceClient(base_url=cfg.base_url)
     if resume_info:
@@ -1340,6 +1370,9 @@ async def main(
         training_client = await service_client.create_lora_training_client_async(
             cfg.model_name, rank=cfg.lora_rank
         )
+
+    # Restore env state on resume (e.g., curriculum tier)
+    train_loop_callbacks.on_checkpoint_restore(start_batch, resume_model_id)
 
     if cfg.checkpoints_gcs_base:
         import wandb as _wandb

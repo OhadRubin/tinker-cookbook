@@ -20,6 +20,7 @@ from tinker_cookbook.recipes.verifiers_rl.verifiers_env import (
     VerifiersEnvGroupBuilder,
     VerifiersRLDatasetBuilder,
     convert_states_to_trajectory_group,
+    get_vf_env,
 )
 from tinker_cookbook.rl import train
 from tinker_cookbook.rl.types import EnvGroupBuilder, TrajectoryGroup
@@ -398,6 +399,24 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
 
     # override do_group_rollout function inside rl.train
     train.do_group_rollout = custom_do_group_rollout
+
+    def _call_vf_env(method: str, *args):
+        """Dispatch to vf_env method if it exists. Silent no-op otherwise.
+
+        This is intentional: not all environments implement curriculum hooks,
+        and we don't want to force them to define empty stubs.
+        """
+        vf_env = get_vf_env()
+        if vf_env is None:
+            return
+        if hasattr(vf_env, method):
+            getattr(vf_env, method)(*args)
+        else:
+            log.debug("vf_env has no method", vf_env_type=type(vf_env).__name__, method=method, component="verifiers_rl")
+
+    train.train_loop_callbacks.on_batch_complete = lambda m: _call_vf_env('on_batch_complete', m)
+    train.train_loop_callbacks.on_checkpoint_save = lambda mid: _call_vf_env('on_checkpoint_save', mid)
+    train.train_loop_callbacks.on_checkpoint_restore = lambda b, mid: _call_vf_env('on_checkpoint_restore', b, mid)
 
     dataset_builder = VerifiersRLDatasetBuilder(
         vf_env_id=cli_config.vf_env_id,

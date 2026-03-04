@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Literal, overload
 
 import httpx
 from observability import log, bootstrap, set_run_id, get_run_id, Events
+from tinker_cookbook.utils.disk_cleanup import ensure_payload_cleanup_started
 from tinker_cookbook.utils.trajectory_progress import _get_current_trajectory
 
 import tinker
@@ -121,6 +122,7 @@ async def sample_with_retries(
     caller_context: Any,
 ) -> tinker.SampleResponse:
     """Sample with tenacity retries and linearly increasing timeout. Never raises."""
+    ensure_payload_cleanup_started()
     payloads_dir = Path("/tmp/sampling_payloads")
     payloads_dir.mkdir(parents=True, exist_ok=True)
     session_id = _build_session_id() or "unknown"

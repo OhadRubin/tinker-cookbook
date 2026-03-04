@@ -2,6 +2,8 @@
 Implements RL on general MDPs
 """
 
+import tinker_cookbook.tinker_sdk_patches  # noqa: F401  # Must be first - patches LossFnType
+
 import asyncio
 import io
 import logging
@@ -233,6 +235,23 @@ def _training_logprobs_from_fwd_bwd(
     return [output["logprobs"].to_torch() for output in fwd_bwd_result.loss_fn_outputs]
 
 
+def _metrics_from_fwd_bwd(
+    fwd_bwd_result: tinker.ForwardBackwardOutput,
+) -> dict[str, float]:
+    """Extract MIS diagnostic metrics from forward_backward result.
+
+    Strips the :reduction suffix from metric names (e.g., 'mis/mask_rate:mean' -> 'mis/mask_rate').
+    The suffix is used by tinker SDK's _metrics_reduction for combining chunked requests.
+    """
+    if not fwd_bwd_result.metrics:
+        return {}
+    # Strip reduction suffix (e.g., ":mean", ":sum") from metric names
+    return {
+        key.rsplit(":", 1)[0]: value
+        for key, value in fwd_bwd_result.metrics.items()
+    }
+
+
 @scope
 async def train_step(
     data_D: List[tinker.Datum],
@@ -241,17 +260,21 @@ async def train_step(
     num_substeps: int,
     loss_fn: LossFnType,
     loss_fn_config: dict[str, float] | None,
-) -> List[torch.Tensor]:
+) -> tuple[List[torch.Tensor], dict[str, float]]:
     """Train the model on collected trajectories.
 
     Pipelines forward_backward and optim_step so they land on the same clock cycle.
+
+    Returns:
+        Tuple of (training_logprobs_D, aggregated_fwd_bwd_metrics)
     """
     batches = split_list(data_D, min(num_substeps, len(data_D)))
     if not batches:
-        return []
+        return [], {}
 
     adam_params = tinker.AdamParams(learning_rate=learning_rate, beta1=0.9, beta2=0.95, eps=1e-8)
     training_logprobs_D: list[torch.Tensor] = []
+    fwd_bwd_metrics: dict[str, float] = {}
 
     # Enqueue first batch
     fwd_bwd_future = await training_client.forward_backward_async(
@@ -272,13 +295,15 @@ async def train_step(
         # Consume current results
         fwd_bwd_result = await fwd_bwd_future.result_async()
         training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
+        # Aggregate metrics (last batch's metrics win - for MIS stats this is fine)
+        fwd_bwd_metrics.update(_metrics_from_fwd_bwd(fwd_bwd_result))
         await optim_future.result_async()
         # Move to next iteration
         if next_fwd_bwd_future is not None and next_optim_future is not None:
             fwd_bwd_future = next_fwd_bwd_future
             optim_future = next_optim_future
 
-    return training_logprobs_D
+    return training_logprobs_D, fwd_bwd_metrics
 
 
 @chz.chz
@@ -1021,6 +1046,8 @@ def _create_producer_consumer(
             with timed(f"train/fwd_bwd_substep_{i_substep}_mb_{i_minibatch}_consume", metrics):
                 result = await item.fwd_bwd_future.result_async()
                 all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(result))
+                # Aggregate MIS metrics from fwd_bwd (last batch's metrics win)
+                metrics.update(_metrics_from_fwd_bwd(result))
                 _mark_groups_fwd_bwd_done(item.builders)
 
             i_minibatch += 1
@@ -1201,7 +1228,7 @@ async def do_train_step_and_get_sampling_client(
     _mark_groups_enqueued(env_group_builders_P)
     effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
     with timed("train", metrics):
-        training_logprobs_D = await train_step(
+        training_logprobs_D, fwd_bwd_metrics = await train_step(
             data_D,
             training_client,
             effective_lr,
@@ -1209,6 +1236,7 @@ async def do_train_step_and_get_sampling_client(
             cfg.loss_fn,
             cfg.loss_fn_config,
         )
+    metrics.update(fwd_bwd_metrics)
     _mark_groups_fwd_bwd_done(env_group_builders_P)
     set_new_optim_step()
 
@@ -1371,8 +1399,8 @@ async def main(
             cfg.model_name, rank=cfg.lora_rank
         )
 
-    # Restore env state on resume (e.g., curriculum tier)
-    train_loop_callbacks.on_checkpoint_restore(start_batch, resume_model_id)
+    # NOTE: on_checkpoint_restore is called AFTER dataset_builder() below,
+    # because the vf_env is created inside dataset_builder() and must exist first.
 
     if cfg.checkpoints_gcs_base:
         import wandb as _wandb
@@ -1398,6 +1426,11 @@ async def main(
 
     # Create dataset from thunk
     dataset, maybe_test_dataset = await cfg.dataset_builder()
+
+    # Restore env state on resume (e.g., resume_offset, curriculum tier)
+    # Must be called AFTER dataset_builder() because vf_env is created there.
+    train_loop_callbacks.on_checkpoint_restore(start_batch, resume_model_id)
+
     evaluators = [evaluator() for evaluator in cfg.evaluator_builders]
     if maybe_test_dataset is not None:
         evaluators.append(RLTestSetEvaluator(maybe_test_dataset, max_tokens=cfg.max_tokens))

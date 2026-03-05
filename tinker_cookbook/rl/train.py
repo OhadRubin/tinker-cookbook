@@ -30,6 +30,12 @@ from tinker_cookbook.rl.data_processing import (
     remove_constant_reward_groups,
 )
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator, compute_trajectory_metrics
+from tinker_cookbook.rolling_metrics import (
+    AdamDiagnosticsState,
+    RawMetrics,
+    init_state as init_diagnostics_state,
+    step as diagnostics_step,
+)
 from tinker_cookbook.rl.metrics import (
     compute_kl_sample_train,
     compute_post_kl,
@@ -76,6 +82,67 @@ class TrainLoopCallbacks:
 
 
 train_loop_callbacks = TrainLoopCallbacks()
+
+
+# Module-level diagnostics state for Adam optimizer health tracking
+_diagnostics_state: AdamDiagnosticsState | None = None
+
+
+def init_diagnostics(window_size: int = 10) -> None:
+    """Initialize diagnostics state. Call at training start."""
+    global _diagnostics_state
+    _diagnostics_state = init_diagnostics_state(window_size=window_size)
+
+
+def update_diagnostics(optim_metrics: dict[str, float], loss: float) -> dict[str, float]:
+    """Update diagnostics state with optim_step metrics, return derived signals for logging."""
+    global _diagnostics_state
+    if _diagnostics_state is None:
+        init_diagnostics()
+
+    raw = RawMetrics(
+        grad_norm=optim_metrics.get("adam/grad_norm", 0.0),
+        grad_mean=optim_metrics.get("adam/grad_mean", 0.0),
+        grad_std=optim_metrics.get("adam/grad_std", 0.0),
+        grad_abs_mean=optim_metrics.get("adam/grad_abs_mean", 0.0),
+        grad_norm_max_layer=optim_metrics.get("adam/grad_norm_max_layer", 0.0),
+        grad_norm_min_layer=optim_metrics.get("adam/grad_norm_min_layer", 1e-12),
+        m_norm=optim_metrics.get("adam/m_norm", 0.0),
+        m_abs_mean=optim_metrics.get("adam/m_abs_mean", 0.0),
+        v_norm=optim_metrics.get("adam/v_norm", 0.0),
+        v_mean=optim_metrics.get("adam/v_mean", 0.0),
+        v_max=optim_metrics.get("adam/v_max", 0.0),
+        effective_lr_mean=optim_metrics.get("adam/effective_lr_mean", 0.0),
+        effective_lr_std=optim_metrics.get("adam/effective_lr_std", 0.0),
+        effective_lr_min=optim_metrics.get("adam/effective_lr_min", 0.0),
+        effective_lr_max=optim_metrics.get("adam/effective_lr_max", 0.0),
+        update_norm=optim_metrics.get("adam/update_norm", 0.0),
+        param_norm=optim_metrics.get("adam/param_norm", 1.0),
+        m_to_v_ratio=optim_metrics.get("adam/m_to_v_ratio", 1.0),
+        loss=loss,
+        lr=optim_metrics.get("adam/lr", 0.0),
+    )
+
+    _diagnostics_state, signals = diagnostics_step(_diagnostics_state, raw)
+
+    # Convert signals to dict with "diag/" prefix for wandb
+    return {f"diag/{k}": v for k, v in signals._asdict().items() if v is not None}
+
+
+def get_diagnostics_state_dict() -> dict | None:
+    """Get diagnostics state as dict for checkpointing."""
+    if _diagnostics_state is None:
+        return None
+    return _diagnostics_state.to_dict()
+
+
+def restore_diagnostics_state(state_dict: dict | None) -> None:
+    """Restore diagnostics state from checkpoint."""
+    global _diagnostics_state
+    if state_dict is None:
+        _diagnostics_state = None
+    else:
+        _diagnostics_state = AdamDiagnosticsState.from_dict(state_dict)
 
 
 def _mark_groups_enqueued(env_group_builders: Sequence[EnvGroupBuilder]) -> None:
@@ -252,6 +319,16 @@ def _metrics_from_fwd_bwd(
     }
 
 
+def _metrics_from_optim_step(optim_result) -> dict[str, float]:
+    """Extract metrics from optim_step result, stripping reduction suffixes."""
+    if not hasattr(optim_result, "metrics") or not optim_result.metrics:
+        return {}
+    return {
+        key.rsplit(":", 1)[0]: value
+        for key, value in optim_result.metrics.items()
+    }
+
+
 @scope
 async def train_step(
     data_D: List[tinker.Datum],
@@ -266,7 +343,8 @@ async def train_step(
     Pipelines forward_backward and optim_step so they land on the same clock cycle.
 
     Returns:
-        Tuple of (training_logprobs_D, aggregated_fwd_bwd_metrics)
+        Tuple of (training_logprobs_D, aggregated_metrics) where aggregated_metrics
+        includes both fwd_bwd metrics and adam tuning metrics from optim_step.
     """
     batches = split_list(data_D, min(num_substeps, len(data_D)))
     if not batches:
@@ -275,6 +353,7 @@ async def train_step(
     adam_params = tinker.AdamParams(learning_rate=learning_rate, beta1=0.9, beta2=0.95, eps=1e-8)
     training_logprobs_D: list[torch.Tensor] = []
     fwd_bwd_metrics: dict[str, float] = {}
+    optim_metrics: dict[str, float] = {}
 
     # Enqueue first batch
     fwd_bwd_future = await training_client.forward_backward_async(
@@ -297,13 +376,16 @@ async def train_step(
         training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
         # Aggregate metrics (last batch's metrics win - for MIS stats this is fine)
         fwd_bwd_metrics.update(_metrics_from_fwd_bwd(fwd_bwd_result))
-        await optim_future.result_async()
+        optim_result = await optim_future.result_async()
+        optim_metrics.update(_metrics_from_optim_step(optim_result))
         # Move to next iteration
         if next_fwd_bwd_future is not None and next_optim_future is not None:
             fwd_bwd_future = next_fwd_bwd_future
             optim_future = next_optim_future
 
-    return training_logprobs_D, fwd_bwd_metrics
+    # Merge fwd_bwd and optim metrics
+    all_metrics = {**fwd_bwd_metrics, **optim_metrics}
+    return training_logprobs_D, all_metrics
 
 
 @chz.chz
@@ -339,11 +421,24 @@ class AsyncConfig:
     in_flight_ratio: float = 1.0
 
 
-def compute_warmup_lr(base_lr: float, current_step: int, n_warmup_steps: int) -> float:
-    """Compute learning rate with linear warmup."""
-    if n_warmup_steps <= 0 or current_step >= n_warmup_steps:
+def compute_warmup_lr(base_lr: float, current_step: int, n_warmup_steps: int, total_steps: int) -> float:
+    """Compute learning rate with linear warmup and linear decay.
+
+    Schedule:
+    1. Warmup (steps 0 to n_warmup_steps): LR linearly increases from ~0 to base_lr
+    2. Decay (steps n_warmup_steps to total_steps): LR linearly decreases from base_lr to 0
+    """
+    if current_step < n_warmup_steps and n_warmup_steps > 0:
+        # Warmup phase: linear increase
+        return base_lr * (current_step + 1) / n_warmup_steps
+
+    # Decay phase: linear decrease from base_lr to 0
+    decay_steps = total_steps - n_warmup_steps
+    if decay_steps <= 0:
         return base_lr
-    return base_lr * (current_step + 1) / n_warmup_steps
+    steps_since_warmup = current_step - n_warmup_steps
+    decay_ratio = 1 - (steps_since_warmup / decay_steps)
+    return base_lr * max(0.0, decay_ratio)
 
 
 @chz.chz
@@ -458,7 +553,7 @@ async def do_sync_training_with_stream_minibatch(
     )
 
     for i_batch in range(start_batch, end_batch):
-        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
+        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps, num_batches)
         metrics = {
             "progress/batch": i_batch,
             "optim/lr": effective_lr,
@@ -527,10 +622,12 @@ async def do_sync_training_with_stream_minibatch(
             ) = await do_train_step_streaming_and_get_sampling_client(
                 cfg,
                 i_batch,
+                num_batches,
                 trajectory_groups_queue,
                 training_client,
                 service_client,
                 tokenizer,
+                lambda _: True,
             )
 
         # Log metrics
@@ -632,7 +729,11 @@ async def do_async_training(
                 do_remove_constant_reward_groups=cfg.remove_constant_reward_groups,
             )
             if trajectory_group is None:
-                trajectory_groups_queue.put_nowait(None)
+                log.info("constant reward group, recycling builder", component="trajectory_group_worker_loop")
+                asyncio.create_task(
+                    env_group_builders_queue.put(env_group_builder),
+                    name="recycle_constant_reward_builder_task",
+                )
             else:
                 metrics["time/trajectory_group_worker_loop/total"] = time.time() - t_start
                 trajectory_groups_queue.put_nowait(
@@ -682,7 +783,7 @@ async def do_async_training(
                     return False
                 return True
 
-            effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
+            effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps, num_batches)
             metrics = {
                 "training_client/step": i_batch,
                 "optim/lr": effective_lr,
@@ -700,6 +801,7 @@ async def do_async_training(
                 ) = await do_train_step_streaming_and_get_sampling_client(
                     cfg,
                     i_batch,
+                    num_batches,
                     trajectory_groups_queue,
                     training_client,
                     service_client,
@@ -727,6 +829,7 @@ async def do_async_training(
                 sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
                     cfg,
                     i_batch,
+                    num_batches,
                     training_client,
                     service_client,
                     tokenizer,
@@ -837,11 +940,19 @@ async def save_checkpoint_and_get_sampling_client(
             )
             await latest_future.result_async()
             train_loop_callbacks.on_checkpoint_save(training_client.model_id)
+            # Save diagnostics state for preemption resilience
+            diag_state = get_diagnostics_state_dict()
+            if diag_state is not None:
+                metadata_helpers.write_metrics_state(training_client.model_id, {"diagnostics_state": diag_state})
             return training_client.create_sampling_client(path_dict["sampler_path"]), metrics
         else:
             sampling_client = await training_client.save_weights_and_get_sampling_client_async()
             await latest_future.result_async()
             train_loop_callbacks.on_checkpoint_save(training_client.model_id)
+            # Save diagnostics state for preemption resilience
+            diag_state = get_diagnostics_state_dict()
+            if diag_state is not None:
+                metadata_helpers.write_metrics_state(training_client.model_id, {"diagnostics_state": diag_state})
             return sampling_client, metrics
 
 
@@ -942,6 +1053,7 @@ def _create_producer_consumer(
     *,
     i_substep: int,
     i_batch: int,
+    num_batches: int,
     cfg: Config,
     trajectory_groups_queue: asyncio.Queue[WrappedTrajectoryGroup | None],
     trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool],
@@ -1019,7 +1131,7 @@ def _create_producer_consumer(
             wrapped_trajectory_groups = []
 
         # All minibatches enqueued, now enqueue optim_step
-        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
+        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps, num_batches)
         adam_params = tinker.AdamParams(
             learning_rate=effective_lr, beta1=0.9, beta2=0.95, eps=1e-8
         )
@@ -1038,7 +1150,14 @@ def _create_producer_consumer(
             if isinstance(item, OptimStepMarker):
                 # All fwd_bwd done, await optim_step
                 with timed(f"train/optim_substep_{i_substep}_consume", metrics):
-                    await item.optim_future.result_async()
+                    optim_result = await item.optim_future.result_async()
+                    # Extract Adam tuning metrics from optim_step result
+                    optim_metrics = _metrics_from_optim_step(optim_result)
+                    metrics.update(optim_metrics)
+                    # Update rolling diagnostics
+                    loss = metrics.get("loss", metrics.get("train/loss", 0.0))
+                    diag_metrics = update_diagnostics(optim_metrics, loss)
+                    metrics.update(diag_metrics)
                     set_new_optim_step()
                 break
 
@@ -1059,6 +1178,7 @@ def _create_producer_consumer(
 async def run_substep(
     i_substep: int,
     i_batch: int,
+    num_batches: int,
     cfg: Config,
     trajectory_groups_queue: asyncio.Queue[WrappedTrajectoryGroup | None],
     trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool],
@@ -1085,6 +1205,7 @@ async def run_substep(
     producer, consumer = _create_producer_consumer(
         i_substep=i_substep,
         i_batch=i_batch,
+        num_batches=num_batches,
         cfg=cfg,
         trajectory_groups_queue=trajectory_groups_queue,
         trajectory_group_filter=trajectory_group_filter,
@@ -1125,11 +1246,12 @@ async def run_substep(
 async def do_train_step_streaming_and_get_sampling_client(
     cfg: Config,
     i_batch: int,
+    num_batches: int,
     trajectory_groups_queue: asyncio.Queue[WrappedTrajectoryGroup | None],
     training_client: tinker.TrainingClient,
     service_client: tinker.ServiceClient,
     tokenizer: Tokenizer,
-    trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool] = lambda _: True,
+    trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool],
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     """
     As soon as we have enough trajectories for a minibatch, we will train on them.
@@ -1159,6 +1281,7 @@ async def do_train_step_streaming_and_get_sampling_client(
         await run_substep(
             i_substep=i_substep,
             i_batch=i_batch,
+            num_batches=num_batches,
             cfg=cfg,
             trajectory_groups_queue=trajectory_groups_queue,
             trajectory_group_filter=trajectory_group_filter,
@@ -1205,6 +1328,7 @@ async def do_train_step_streaming_and_get_sampling_client(
 async def do_train_step_and_get_sampling_client(
     cfg: Config,
     i_batch: int,
+    num_batches: int,
     training_client: tinker.TrainingClient,
     service_client: tinker.ServiceClient,
     tokenizer: Tokenizer,
@@ -1226,7 +1350,7 @@ async def do_train_step_and_get_sampling_client(
     metrics.update(prepare_minibatch_metrics)
 
     _mark_groups_enqueued(env_group_builders_P)
-    effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
+    effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps, num_batches)
     with timed("train", metrics):
         training_logprobs_D, fwd_bwd_metrics = await train_step(
             data_D,
@@ -1238,6 +1362,10 @@ async def do_train_step_and_get_sampling_client(
         )
     metrics.update(fwd_bwd_metrics)
     _mark_groups_fwd_bwd_done(env_group_builders_P)
+    # Update rolling diagnostics
+    loss = metrics.get("loss", metrics.get("train/loss", 0.0))
+    diag_metrics = update_diagnostics(fwd_bwd_metrics, loss)
+    metrics.update(diag_metrics)
     set_new_optim_step()
 
     sampling_client, full_batch_metrics = await compute_full_batch_metrics_and_get_sampling_client(
@@ -1277,7 +1405,7 @@ async def do_sync_training(
     )
 
     for i_batch in range(start_batch, end_batch):
-        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps)
+        effective_lr = compute_warmup_lr(cfg.learning_rate, i_batch, cfg.n_warmup_steps, num_batches)
         metrics = {
             "progress/batch": i_batch,
             "optim/lr": effective_lr,
@@ -1329,6 +1457,7 @@ async def do_sync_training(
         sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
             cfg,
             i_batch,
+            num_batches,
             training_client,
             service_client,
             tokenizer,
@@ -1430,6 +1559,13 @@ async def main(
     # Restore env state on resume (e.g., resume_offset, curriculum tier)
     # Must be called AFTER dataset_builder() because vf_env is created there.
     train_loop_callbacks.on_checkpoint_restore(start_batch, resume_model_id)
+
+    # Restore diagnostics state for rolling metrics
+    if resume_model_id is not None:
+        metrics_state = metadata_helpers.load_metrics_state_from_gcs(resume_model_id)
+        restore_diagnostics_state(metrics_state.get("diagnostics_state"))
+    else:
+        init_diagnostics()
 
     evaluators = [evaluator() for evaluator in cfg.evaluator_builders]
     if maybe_test_dataset is not None:

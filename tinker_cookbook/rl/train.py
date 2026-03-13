@@ -926,9 +926,12 @@ async def save_checkpoint_and_get_sampling_client(
     metrics = {}
     with timed("save_checkpoint", metrics):
         # Save rolling training state every step for preemption resilience
-        latest_future = await training_client.save_state_async(
-            f"{metadata_helpers.LATEST_PREFIX}{i_batch:06d}"
-        )
+        latest_name = f"{metadata_helpers.LATEST_PREFIX}{i_batch:06d}"
+        latest_future = None
+        if metadata_helpers.is_cloud_mode():
+            metadata_helpers.write_checkpoint_marker(training_client.model_id, latest_name)
+        else:
+            latest_future = await training_client.save_state_async(latest_name)
 
         if save_every > 0 and i_batch > start_batch and i_batch % save_every == 0:
             path_dict = await checkpoint_utils.save_checkpoint_async(
@@ -938,8 +941,10 @@ async def save_checkpoint_and_get_sampling_client(
                 loop_state={"batch": i_batch},
                 kind="both",
             )
-            await latest_future.result_async()
+            if latest_future is not None:
+                await latest_future.result_async()
             train_loop_callbacks.on_checkpoint_save(training_client.model_id)
+            
             # Save diagnostics state for preemption resilience
             diag_state = get_diagnostics_state_dict()
             if diag_state is not None:
@@ -947,7 +952,8 @@ async def save_checkpoint_and_get_sampling_client(
             return training_client.create_sampling_client(path_dict["sampler_path"]), metrics
         else:
             sampling_client = await training_client.save_weights_and_get_sampling_client_async()
-            await latest_future.result_async()
+            if latest_future is not None:
+                await latest_future.result_async()
             train_loop_callbacks.on_checkpoint_save(training_client.model_id)
             # Save diagnostics state for preemption resilience
             diag_state = get_diagnostics_state_dict()
